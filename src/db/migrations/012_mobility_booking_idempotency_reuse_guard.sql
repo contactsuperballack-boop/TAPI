@@ -1,0 +1,13 @@
+-- Sprint 1 hardening: flights/hotels/orders all guard against a client
+-- reusing the same Idempotency-Key with a DIFFERENT request body — see
+-- Bookings.createOrGetExisting's request_hash comparison and
+-- Errors.IdempotencyKeyReused in src/repositories/index.js /
+-- src/domain/errors.js. mobility_bookings (migration 010) implemented its
+-- own idempotency check (SELECT ... WHERE idempotency_key=$2) without this
+-- guard, so a repeated key with a different tripId/passenger/holdId would
+-- silently return the ORIGINAL booking instead of erroring — the client
+-- would think their new request succeeded as-is when it was actually
+-- ignored. Adding the same column the other verticals use so the same
+-- hashRequestBody() helper (already exported from repositories/index.js)
+-- can be reused here instead of reinventing it.
+ALTER TABLE mobility_bookings ADD COLUMN request_hash TEXT;

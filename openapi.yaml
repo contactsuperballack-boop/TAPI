@@ -1,0 +1,664 @@
+openapi: 3.0.3
+info:
+  title: TAPI — Travel API Platform
+  version: "0.1.0"
+  description: >
+    Sprint 0/1 vertical slice: agency auth -> flight search -> offer ->
+    validate -> book -> retrieve, via LetsFG. Frozen against what's actually
+    implemented in src/routes/flights.routes.js — this file is the contract,
+    not aspiration. Extend it in the same commit as any route change.
+servers:
+  - url: http://localhost:3000/v1
+paths:
+  /orders:
+    post:
+      summary: Create an order from one or more confirmed bookings (T-070, T-071)
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOrderRequest' }
+      responses:
+        '201':
+          description: Order created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderResponse' }
+        '200': { description: Idempotency key already used — returns the existing order }
+        '400': { description: "A booking isn't confirmed, already belongs to another order, or currencies don't match" }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /orders/{orderId}:
+    get:
+      summary: Retrieve an order
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Order detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /orders/{orderId}/pay:
+    post:
+      summary: Initiate payment for an order (T-072). Returns a checkoutUrl.
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        '201': { description: Payment initiated }
+        '200': { description: Idempotency key already used — returns the existing payment, does not re-charge }
+        '400': { description: Order is not in 'open' status }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /orders/{orderId}/refund:
+    post:
+      summary: Refund a paid order (T-076)
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: orderId, in: path, required: true, schema: { type: string, format: uuid } }
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        '200': { description: Refunded — order moves to 'cancelled' }
+        '400': { description: Order has no captured payment to refund }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /payments/webhook:
+    post:
+      summary: >
+        Payment provider webhook. NOT behind agency auth — protected by
+        signature verification instead. The ONLY path that can mark a
+        payment captured/failed or an order paid (T-072, T-073).
+      requestBody:
+        content:
+          application/json:
+            schema: { type: string, format: binary, description: "Raw body, signature-verified" }
+      responses:
+        '200': { description: Processed (or already-processed, idempotent against duplicate deliveries) }
+        '401': { description: Invalid signature — request rejected outright }
+        '404': { description: Unknown payment reference }
+
+  /auth/api-keys:
+    post:
+      summary: Create a new API key for the authenticated agency. Raw key is returned exactly once.
+      security: [{ agencyApiKey: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateApiKeyRequest' }
+      responses:
+        '201':
+          description: Key created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyCreatedResponse' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+    get:
+      summary: List API keys for the authenticated agency. Never exposes the secret or hash.
+      security: [{ agencyApiKey: [] }]
+      responses:
+        '200':
+          description: Key list
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApiKeyListResponse' }
+
+  /auth/api-keys/{id}/revoke:
+    post:
+      summary: Revoke an API key. 404s if the key doesn't exist, isn't owned by this agency, or is already revoked.
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Revoked }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /flights/search:
+    post:
+      summary: Start an async flight search
+      security: [{ agencyApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FlightSearchRequest' }
+      responses:
+        '202':
+          description: Search accepted, poll for results
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchAccepted' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /flights/search/{searchId}:
+    get:
+      summary: Poll search status/results
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: searchId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Search status, with offers if completed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /flights/offers/{offerId}:
+    get:
+      summary: Offer detail
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: offerId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Normalized offer
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410':
+          description: Offer expired
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Problem' }
+
+  /flights/offers/{offerId}/validate:
+    post:
+      summary: Reprice/unlock an offer before booking
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: offerId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Validation result }
+        '409': { description: Price changed or sold out }
+
+  /flights/bookings:
+    post:
+      summary: Create a flight booking
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FlightBookingRequest' }
+      responses:
+        '201':
+          description: Booking created (status reflects what the supplier actually confirmed — see FlightBookingResponse.status)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlightBookingResponse' }
+        '200':
+          description: Idempotency key already used — returns the existing booking, not a duplicate
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '410': { description: Offer expired }
+        '422': { description: "Idempotency-Key reused with a materially different request body (IDEMPOTENCY_KEY_REUSED_WITH_DIFFERENT_BODY)" }
+
+  /flights/bookings/{bookingId}:
+    get:
+      summary: Booking status / PNR retrieval (reconciles with supplier if still pending)
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: bookingId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Booking status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlightBookingResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /hotels/search:
+    post:
+      summary: Start an async hotel search
+      security: [{ agencyApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HotelSearchRequest' }
+      responses:
+        '202': { description: Search accepted, poll for results }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /hotels/search/{searchId}:
+    get:
+      summary: Poll hotel search status/results
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: searchId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Search status, with offers if completed }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /hotels/{hotelId}/offers/{offerId}:
+    get:
+      summary: Rate detail
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: hotelId, in: path, required: true, schema: { type: string } }
+        - { name: offerId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Normalized rate offer }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { description: Offer expired }
+
+  /hotels/offers/{offerId}/validate:
+    post:
+      summary: >
+        Recheck a rate before booking. CONFIRMED as required by LetsFG when
+        rate_type=RECHECK; called unconditionally in the MVP adapter — see
+        letsfgHotelAdapter.js.
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: offerId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Recheck result }
+        '409': { description: Price changed or sold out }
+
+  /hotels/bookings:
+    post:
+      summary: >
+        Create a hotel booking. Always async (T-055) — never returns
+        'confirmed' synchronously. Poll GET /hotels/bookings/{bookingId}.
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/HotelBookingRequest' }
+      responses:
+        '202':
+          description: Booking job started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HotelBookingResponse' }
+        '200': { description: Idempotency key already used — returns the existing booking }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '410': { description: Offer expired }
+        '422': { description: "Idempotency-Key reused with a materially different request body" }
+
+  /hotels/bookings/{bookingId}:
+    get:
+      summary: Poll booking job / confirmation. Once confirmed, response includes payLink and balanceDueBy (T-057).
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: bookingId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Booking status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HotelBookingResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /hotels/bookings/{bookingId}/cancel:
+    post:
+      summary: >
+        Cancel per supplier policy. CONFIRMED: LetsFG supports a simulate
+        mode (?simulate=true) that previews the refund without cancelling.
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: bookingId, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: simulate, in: query, required: false, schema: { type: boolean } }
+      responses:
+        '200': { description: Cancellation result (or simulated result) }
+        '400': { description: Booking is not in a cancellable state }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /buses/search:
+    post:
+      summary: Start an async bus search
+      security: [{ agencyApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [origin, destination, departDate]
+              properties:
+                origin: { type: string, minLength: 2 }
+                destination: { type: string, minLength: 2 }
+                departDate: { type: string, format: date }
+                passengers: { type: integer, minimum: 1, maximum: 20, default: 1 }
+                busType: { type: string }
+                departureTime: { type: string, pattern: '^\\d{2}:\\d{2}$' }
+                currency: { type: string, minLength: 3, maxLength: 3 }
+      responses:
+        '202': { description: Search accepted, poll for results }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /buses/search/{searchId}:
+    get:
+      summary: Poll bus search status and results
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: searchId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Search status, with offers if completed }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /buses/offers/{offerId}:
+    get:
+      summary: Retrieve a bus offer
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: offerId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Normalized bus offer }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '410': { description: Offer expired }
+
+  /buses/offers/{offerId}/validate:
+    post:
+      summary: Validate bus offer availability and price
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: offerId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Validation result }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /buses/bookings:
+    post:
+      summary: Create an idempotent bus booking
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: Idempotency-Key, in: header, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [offerId, passengers, contact]
+              properties:
+                offerId: { type: string, format: uuid }
+                passengers: { type: array, minItems: 1, maxItems: 20, items: { type: object } }
+                contact: { type: object }
+                pickupPoint: { type: string }
+                dropoffPoint: { type: string }
+      responses:
+        '201': { description: Bus booking created }
+        '200': { description: Idempotent retry returns the existing booking }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '410': { description: Offer expired }
+        '422': { description: Idempotency key reused with a different request body }
+
+  /buses/bookings/{bookingId}:
+    get:
+      summary: Retrieve and reconcile a bus booking
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: bookingId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Bus booking status and seat details }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /buses/bookings/{bookingId}/cancel:
+    post:
+      summary: Cancel a confirmed bus booking
+      security: [{ agencyApiKey: [] }]
+      parameters:
+        - { name: bookingId, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200': { description: Bus booking cancelled }
+        '400': { description: Booking is not in a cancellable state }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+components:
+  securitySchemes:
+    agencyApiKey:
+      type: http
+      scheme: bearer
+      description: Agency-scoped API key, not a consumer JWT. See middleware/auth.js.
+
+  responses:
+    ValidationError:
+      description: Request failed schema validation
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    Unauthorized:
+      description: Missing/invalid/revoked/expired API key
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    NotFound:
+      description: Resource not found or not owned by the authenticated agency
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    RateLimited:
+      description: Too many requests (token-bucket limiter, see middleware/rateLimiter.js)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    CreateApiKeyRequest:
+      type: object
+      properties:
+        label: { type: string, maxLength: 200 }
+        expiresInDays: { type: integer, minimum: 1, maximum: 3650, description: "Omit for a key that never expires" }
+        env: { type: string, enum: [live, test] }
+
+    ApiKeyClientView:
+      type: object
+      description: Never includes the raw key or its hash.
+      properties:
+        id: { type: string, format: uuid }
+        keyPrefix: { type: string, description: "e.g. tapi_live_Ab3xY9kLm2Qp — enough to identify the key, not enough to reconstruct it" }
+        label: { type: string, nullable: true }
+        status: { type: string, enum: [active, revoked] }
+        isActive: { type: boolean, description: "status === 'active' AND not expired" }
+        isExpired: { type: boolean }
+        expiresAt: { type: string, format: date-time, nullable: true }
+        lastUsedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        revokedAt: { type: string, format: date-time, nullable: true }
+
+    ApiKeyCreatedResponse:
+      type: object
+      properties:
+        apiKey: { type: string, description: "The raw secret. Shown exactly once — store it now." }
+        client: { $ref: '#/components/schemas/ApiKeyClientView' }
+
+    ApiKeyListResponse:
+      type: object
+      properties:
+        keys:
+          type: array
+          items: { $ref: '#/components/schemas/ApiKeyClientView' }
+
+    CreateOrderRequest:
+      type: object
+      required: [bookingIds]
+      properties:
+        bookingIds:
+          type: array
+          minItems: 1
+          items: { type: string, format: uuid }
+        customerId: { type: string, format: uuid }
+
+    OrderResponse:
+      type: object
+      properties:
+        orderId: { type: string, format: uuid }
+        status: { type: string, enum: [open, paid, cancelled] }
+        currency: { type: string }
+        supplierCost: { type: number, description: "Sum of constituent offer prices" }
+        markupAmount: { type: number, description: "Config-driven (ORDER_MARKUP_PERCENT) — commercial model still pending Decision Gate" }
+        serviceFee: { type: number }
+        taxAmount: { type: number, description: "Always 0 in MVP — no jurisdiction decision made yet" }
+        totalPrice: { type: number }
+        createdAt: { type: string, format: date-time }
+
+    Problem:
+      type: object
+      description: RFC 7807 Problem Details — see domain/errors.js and middleware/errorHandler.js
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        timestamp: { type: string, format: date-time }
+        code: { type: string }
+
+    FlightSearchRequest:
+      type: object
+      required: [origin, destination, departDate, passengers]
+      properties:
+        origin: { type: string, minLength: 3, maxLength: 3, example: LOS }
+        destination: { type: string, minLength: 3, maxLength: 3, example: LHR }
+        departDate: { type: string, format: date }
+        returnDate: { type: string, format: date }
+        passengers:
+          type: object
+          required: [adults]
+          properties:
+            adults: { type: integer, minimum: 1 }
+            children: { type: integer, minimum: 0 }
+            infants: { type: integer, minimum: 0 }
+        cabinClass: { type: string, enum: [economy, premium, business, first] }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+
+    SearchAccepted:
+      type: object
+      properties:
+        searchId: { type: string, format: uuid }
+        status: { type: string, enum: [processing] }
+        pollUrl: { type: string }
+
+    SearchResult:
+      type: object
+      properties:
+        searchId: { type: string, format: uuid }
+        status: { type: string, enum: [processing, completed, failed] }
+        offers:
+          type: array
+          items: { type: object }
+
+    FlightBookingRequest:
+      type: object
+      required: [offerId, passengers, contact]
+      properties:
+        offerId: { type: string, format: uuid }
+        passengers:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [firstName, lastName, dateOfBirth]
+            properties:
+              firstName: { type: string }
+              lastName: { type: string }
+              dateOfBirth: { type: string, format: date }
+              passportNumber: { type: string }
+              nationality: { type: string }
+        contact:
+          type: object
+          required: [email]
+          properties:
+            email: { type: string, format: email }
+            phone: { type: string }
+        travelerIds:
+          type: array
+          items: { type: string, format: uuid }
+
+    FlightBookingResponse:
+      type: object
+      properties:
+        bookingId: { type: string, format: uuid }
+        status:
+          type: string
+          description: >
+            Only 'confirmed' means the supplier actually returned a PNR.
+            'action_required' means the supplier handed back a checkout URL
+            instead (see bookingUrl) and no reservation exists yet.
+            'reconciliation_required' means the supplier call timed out or
+            was unreachable — this is NOT the same as 'failed': the supplier
+            may have accepted the booking and simply failed to respond.
+            Do not treat it as safe to retry with a new idempotency key
+            without reconciling against the supplier first.
+          enum: [created, pending, processing, confirmed, action_required, price_changed, failed, reconciliation_required, cancel_requested, cancelled, refund_pending, refunded, refund_failed]
+        supplierReference: { type: string, nullable: true }
+        bookingUrl: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    HotelSearchRequest:
+      type: object
+      required: [destination, checkIn, checkOut, guests]
+      properties:
+        destination: { type: string }
+        checkIn: { type: string, format: date }
+        checkOut: { type: string, format: date }
+        guests:
+          type: object
+          required: [adults]
+          properties:
+            adults: { type: integer, minimum: 1 }
+            children: { type: integer, minimum: 0 }
+        rooms: { type: integer, minimum: 1 }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+
+    HotelBookingRequest:
+      type: object
+      required: [offerId, guests, contact]
+      properties:
+        offerId: { type: string, format: uuid }
+        guests:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required: [firstName, lastName]
+            properties:
+              firstName: { type: string }
+              lastName: { type: string }
+        contact:
+          type: object
+          required: [email]
+          properties:
+            email: { type: string, format: email }
+            phone: { type: string }
+
+    HotelBookingResponse:
+      type: object
+      properties:
+        bookingId: { type: string, format: uuid }
+        status:
+          type: string
+          description: Always starts 'pending' — hotel booking is async (T-055). Only 'confirmed' once LetsFG's booking job succeeds.
+          enum: [created, pending, processing, confirmed, action_required, price_changed, failed, reconciliation_required, cancel_requested, cancelled, refund_pending, refunded, refund_failed]
+        confirmationNumber: { type: string, nullable: true }
+        payLink: { type: string, nullable: true, description: "Where the 95% balance is paid, direct to the hotel." }
+        balanceDueBy: { type: string, format: date-time, nullable: true, description: "Hotel's own auto-cancel deadline." }
+        reservationFeeStatus: { type: string, enum: [pending, charged, failed], nullable: true }
+        cancellationTerms: { type: object, nullable: true }
+        createdAt: { type: string, format: date-time }
