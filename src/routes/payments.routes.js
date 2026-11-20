@@ -9,6 +9,7 @@
 const express = require("express");
 const { Payments } = require("../repositories");
 const { getPaymentProvider } = require("../services/paymentProviderRegistry");
+const { toMinor } = require("../domain/money");
 
 const router = express.Router();
 
@@ -35,7 +36,8 @@ router.post("/webhook", async (req, res, next) => {
     // Idempotent against duplicate webhook deliveries (providers routinely
     // retry): if this payment already reached a terminal state, don't
     // reprocess it.
-    if (payment.status === "captured" || payment.status === "failed") {
+    if (payment.status === "captured" || payment.status === "failed" || payment.status === "voided" ||
+        (event.status === "authorized" && payment.status !== "pending")) {
       return res.status(200).json({ received: true, alreadyProcessed: true });
     }
 
@@ -46,7 +48,13 @@ router.post("/webhook", async (req, res, next) => {
     // still capture the payment and mark the order paid. Signature proves
     // the event came from the provider; it does NOT prove the event matches
     // what we expect for this specific payment — that's a separate check.
-    if (event.status === "captured") {
+    if (event.status === "authorized") {
+      // Funds HELD, not charged. Same amount/currency discipline as capture: a signed event is not an expected event.
+      if (Number(event.amount) !== Number(payment.amount) || event.currency !== payment.currency) {
+        return res.status(409).json({ code: "WEBHOOK_AMOUNT_MISMATCH", detail: `Authorisation of ${event.amount} ${event.currency} does not match payment ${payment.id} (${payment.amount} ${payment.currency}). Not recorded — needs manual review.` });
+      }
+      await Payments.markAuthorizedFromWebhook(payment.id, { amountMinor: toMinor(payment.amount, payment.currency), expiresAt: event.authorizationExpiresAt, eventId: event.eventId });
+    } else if (event.status === "captured") {
       const amountMatches = Number(event.amount) === Number(payment.amount);
       const currencyMatches = event.currency === payment.currency;
       if (!amountMatches || !currencyMatches) {

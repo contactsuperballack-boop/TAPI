@@ -5,7 +5,7 @@
 //   4. atomically consume the approval (single use)
 //   5. book through TAPI with an idempotency key derived from the approval id
 // Nothing here writes booking state; TAPI's state machine owns that.
-const { checkApproval, fromRow } = require("../domain/approval");
+const { checkApproval, fromRow, RETRY_WINDOW_MS } = require("../domain/approval");
 
 function approvalIdempotencyKey(approvalId) {
   return `agent-approval-${approvalId}`; // same approval => same key => safe retry after a timeout
@@ -24,6 +24,10 @@ async function executeApprovedBooking({ agencyId, approvalId, kind, bookingBody 
   // (timeout / crash). Re-send with the SAME key; TAPI dedupes. No new spend.
   let livePrice;
   const isRetry = approval.status === "consumed" && !approval.consumedBookingId;
+  if (isRetry) {
+    const spent = approval.consumedAt ? new Date(approval.consumedAt).getTime() : NaN;
+    if (!Number.isFinite(spent) || now.getTime() - spent > RETRY_WINDOW_MS) return { ok: false, reason: "APPROVAL_RETRY_WINDOW_EXPIRED" }; // unknown age fails closed
+  }
   if (!isRetry) {
     let verdict;
     try {
@@ -51,10 +55,14 @@ async function executeApprovedBooking({ agencyId, approvalId, kind, bookingBody 
   }
 
   const book = kind === "flight" ? tapi.bookFlight : tapi.bookHotel;
-  const booking = await book.call(tapi, { ...bookingBody, offerId: approval.offerId } /* approved offer always wins */, key);
+  let booking;
+  try { booking = await book.call(tapi, { ...bookingBody, offerId: approval.offerId } /* approved offer always wins */, key); }
+  catch (err) { err.afterConsume = true; err.approvalId = approval.id; throw err; } // the approval is spent: callers must treat the outcome as unknown unless it is a definitive refusal
   const bookingId = booking.bookingId || booking.id;
-  if (bookingId) await approvals.attachBooking(approval.id, agencyId, bookingId);
+  // Best effort: the booking exists at this point, so a failure to note its id on the approval must not turn a success into an error.
+  // (The item records the booking id itself, and a same-key retry replays the stored response, so it cannot double-book.)
+  if (bookingId) { try { await approvals.attachBooking(approval.id, agencyId, bookingId); } catch (err) { console.error(`[booking] could not record booking id on approval ${approval.id}: ${err.code || "error"}`); } }
   return { ok: true, booking, idempotencyKey: key, livePrice }; // livePrice is undefined on the retry path (no revalidation happened)
 }
 
-module.exports = { executeApprovedBooking, approvalIdempotencyKey };
+module.exports = { executeApprovedBooking, approvalIdempotencyKey, RETRY_WINDOW_MS };

@@ -1,4 +1,6 @@
 const db = require("../db");
+const { RETRY_WINDOW_MINUTES } = require("../domain/approval");
+const { openPassport } = require("../services/travelerSecrets");
 
 // DATE columns come back from pg as JS Dates (timezone-shifting, and rejected by TAPI's YYYY-MM-DD booking schema),
 // so every query here returns them as plain 'YYYY-MM-DD' text.
@@ -24,12 +26,15 @@ const Trips = {
     const { rows } = await db.query(
       `SELECT i.*, a.id AS approval_id, a.expires_at AS approval_expires_at,
               fr.id AS request_id, fr.status AS request_status, fr.agent_note AS request_agent_note, fr.decline_reason AS request_decline_reason,
-              fr.traveller_note AS request_traveller_note, fu.full_name AS request_agent_name
+              fr.traveller_note AS request_traveller_note, fu.full_name AS request_agent_name, rt.id AS retry_approval_id
          FROM agent_trip_items i
          LEFT JOIN agent_trip_approvals a ON a.trip_item_id = i.id AND a.status = 'active' AND a.expires_at > now()
          LEFT JOIN LATERAL (SELECT * FROM fulfilment_requests f WHERE f.trip_item_id = i.id ORDER BY f.created_at DESC LIMIT 1) fr ON true
          LEFT JOIN users fu ON fu.id = fr.claimed_by_user_id
-        WHERE i.trip_id=$1 AND i.agency_id=$2 ORDER BY i.created_at`, [tripId, agencyId]);
+         -- a spent approval with no booking id, still inside the safe same-key retry window
+         LEFT JOIN LATERAL (SELECT r.id FROM agent_trip_approvals r WHERE r.trip_item_id = i.id AND r.status = 'consumed' AND r.consumed_booking_id IS NULL
+                              AND r.consumed_at > now() - make_interval(mins => $3) ORDER BY r.consumed_at DESC LIMIT 1) rt ON true
+        WHERE i.trip_id=$1 AND i.agency_id=$2 ORDER BY i.created_at`, [tripId, agencyId, RETRY_WINDOW_MINUTES]);
     return rows;
   },
   async getItem(itemId, tripId, agencyId) {
@@ -56,17 +61,30 @@ const Trips = {
     await db.query(`INSERT INTO agent_trip_events (agency_id, trip_id, type, payload) VALUES ($1,$2,$3,$4)`, [agencyId, tripId, type, JSON.stringify(payload || {})]);
   },
   // Booking details come from TAPI's own travelers/customers tables, resolved server-side. They never pass through the model.
-  async bookingParties(trip) {
+  // Booking details come from TAPI's own travelers/customers tables, resolved server-side. They never pass through the model.
+  // The passport is decrypted only when asked for (a booking needs it; most callers just need names and an email).
+  async bookingParties(trip, { withPassport = true } = {}) {
     if (!trip.traveler_id) return null;
     const { rows } = await db.query(
-      `SELECT t.first_name, t.last_name, to_char(t.date_of_birth,'YYYY-MM-DD') AS date_of_birth, t.passport_number, t.nationality, c.email, c.phone
+      `SELECT t.id, t.first_name, t.last_name, to_char(t.date_of_birth,'YYYY-MM-DD') AS date_of_birth, t.passport_number, t.passport_number_enc, t.nationality, c.email, c.phone
          FROM travelers t LEFT JOIN customers c ON c.id = t.customer_id
         WHERE t.id=$1 AND t.agency_id=$2`, [trip.traveler_id, trip.agency_id]);
-    return rows[0] || null;
+    const r = rows[0];
+    if (!r) return null;
+    const { passport_number_enc, id, ...rest } = r;
+    return { ...rest, passport_number: withPassport ? openPassport(r) : (r.passport_number_enc || r.passport_number ? "on-file" : null) };
   },
 };
 
 Object.assign(Trips, {
+  // A person checked with the supplier and closes an item that was "under review". Only items in that state can be resolved.
+  async resolveItem(itemId, agencyId, { outcome, reference }) {
+    const { rows } = await db.query(
+      `UPDATE agent_trip_items SET status = $3, confirmation_ref = COALESCE($4, confirmation_ref), price_label = CASE WHEN $3 = 'confirmed' THEN 'confirmed' ELSE 'unverified' END, updated_at = now()
+        WHERE id = $1 AND agency_id = $2 AND status = 'reconciliation_required' RETURNING id`,
+      [itemId, agencyId, outcome === "confirmed" ? "confirmed" : "selected", reference || null]);
+    return rows[0] || null;
+  },
   async setItemMode(itemId, agencyId, mode) { await db.query(`UPDATE agent_trip_items SET fulfilment_mode=$3, updated_at=now() WHERE id=$1 AND agency_id=$2`, [itemId, agencyId, mode]); },
   // The supplier just revalidated this price at booking time, so it is now a confirmed price.
   async confirmPrice(itemId, agencyId, price) {

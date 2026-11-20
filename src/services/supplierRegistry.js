@@ -15,16 +15,47 @@
 const { LetsFGAdapter } = require("./adapters/letsfgAdapter");
 const { LetsFGHotelAdapter } = require("./adapters/letsfgHotelAdapter");
 const { NigerianDomesticAdapter } = require("./adapters/nigerianDomesticAdapter");
+const { TiqwaAdapter } = require("./adapters/tiqwaAdapter");
+const { assertFlightSupplier } = require("./flightSupplier.interface");
 const { MockBusAdapter } = require("./adapters/mockBusAdapter");
 const { Errors } = require("../domain/errors");
 
 let _letsfg = null;
 let _letsfgHotel = null;
 let _ngDomestic = null;
+let _tiqwa = null;
 let _mockBus = null;
 
+// Flight supplier codes this build knows about. A code being known does not make
+// it usable: scaffolds are gated behind explicit env flags below.
+const KNOWN_FLIGHT_SUPPLIERS = ["letsfg", "ng_domestic", "tiqwa"];
+
+/** The supplier new flight searches run against. Override with FLIGHT_SUPPLIER_CODE. */
+function defaultFlightSupplierCode() {
+  const code = process.env.FLIGHT_SUPPLIER_CODE || "letsfg";
+  if (!KNOWN_FLIGHT_SUPPLIERS.includes(code)) {
+    throw Errors.SupplierNotConfigured(`FLIGHT_SUPPLIER_CODE '${code}' is not a known flight supplier (${KNOWN_FLIGHT_SUPPLIERS.join(", ")}).`);
+  }
+  return code;
+}
+
+/** Validated accessor: every adapter handed out is checked against the FlightSupplier contract once. */
 function getSupplier(code) {
+  const adapter = _getSupplierUnchecked(code);
+  if (!adapter.__contractChecked) {
+    try { assertFlightSupplier(adapter, `flight supplier '${code}'`); } catch (err) { throw Errors.SupplierNotConfigured(err.message); }
+    Object.defineProperty(adapter, "__contractChecked", { value: true });
+  }
+  return adapter;
+}
+
+function _getSupplierUnchecked(code) {
   if (code !== "letsfg") {
+    if (code === "tiqwa" && process.env.TIQWA_ENABLED === "true") {
+      // Scaffold: every method throws until Tiqwa's API is verified and contracted. See tiqwaAdapter.js.
+      _tiqwa = _tiqwa || new TiqwaAdapter({ baseUrl: process.env.TIQWA_BASE_URL });
+      return _tiqwa;
+    }
     if (code === "ng_domestic" && process.env.DOMESTIC_SUPPLIER_ENABLED === "true") {
       // See nigerianDomesticAdapter.js — this flag removes the registry
       // guard only; every method on the adapter itself still throws
@@ -37,10 +68,11 @@ function getSupplier(code) {
   if (!_letsfg) {
     try {
       _letsfg = new LetsFGAdapter({
-        authMode: process.env.LETSFG_AUTH_MODE || "pfs",
+        authMode: process.env.LETSFG_AUTH_MODE || "developer",
         bearerToken: process.env.LETSFG_BEARER_TOKEN,
         apiKey: process.env.LETSFG_API_KEY,
         baseUrl: process.env.LETSFG_BASE_URL,
+        environment: process.env.LETSFG_ENVIRONMENT || "production",
       });
     } catch (err) {
       throw Errors.SupplierNotConfigured(`LetsFG flight adapter misconfigured: ${err.message}`);
@@ -65,6 +97,9 @@ function getHotelSupplier(code) {
     // Hotels are Developer-API-only per LetsFG's public docs (see
     // letsfgHotelAdapter.js header) — no PFS/free path exists for hotels,
     // unlike flights.
+    if ((process.env.LETSFG_ENVIRONMENT || "production") === "sandbox") {
+      throw Errors.SupplierNotConfigured("LetsFG hotel search is disabled in sandbox: LetsFG does not document a hotel sandbox, and this configuration blocks live hotel calls.");
+    }
     if (!process.env.LETSFG_API_KEY) {
       throw Errors.SupplierNotConfigured("Hotel supplier 'letsfg' requires LETSFG_API_KEY (Developer API) to be set — no free/PFS path exists for hotels.");
     }
@@ -73,6 +108,7 @@ function getHotelSupplier(code) {
         authMode: "developer",
         apiKey: process.env.LETSFG_API_KEY,
         baseUrl: process.env.LETSFG_BASE_URL,
+        environment: process.env.LETSFG_ENVIRONMENT || "production",
       });
     } catch (err) {
       throw Errors.SupplierNotConfigured(`LetsFG hotel adapter misconfigured: ${err.message}`);
@@ -93,4 +129,4 @@ function getSupplierHealth() {
   return health;
 }
 
-module.exports = { getSupplier, getHotelSupplier, getBusSupplier, getSupplierHealth };
+module.exports = { KNOWN_FLIGHT_SUPPLIERS, defaultFlightSupplierCode, getSupplier, getHotelSupplier, getBusSupplier, getSupplierHealth };

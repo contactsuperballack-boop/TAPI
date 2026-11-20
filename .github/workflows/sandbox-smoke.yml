@@ -1,0 +1,32 @@
+name: LetsFG sandbox smoke (manual)
+
+# Manual only: needs the LETSFG_API_KEY repository secret and outbound network. Uses the documented sandbox lane
+# with fake passengers; no real booking or payment is possible. Pick a scenario to exercise a failure path.
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "success | price_change | extra | seller_failed | needs_attention | payment_declined | payment_method_required | temporarily_unavailable"
+        default: success
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: node scripts/letsfg-sandbox-smoke.js
+        env:
+          LETSFG_ENVIRONMENT: sandbox
+          LETSFG_AUTH_MODE: developer
+          LETSFG_API_KEY: ${{ secrets.LETSFG_API_KEY }}
+          LETSFG_BASE_URL: https://letsfg.co
+          LETSFG_SANDBOX_SCENARIO: ${{ inputs.scenario }}

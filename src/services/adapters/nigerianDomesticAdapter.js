@@ -22,7 +22,7 @@
 // See migration 005_domestic_supplier_evaluation.sql for where to track
 // progress through steps 1-4 without writing throwaway code for it.
 
-const { FlightSupplier } = require("../flightSupplier.interface");
+const { FlightSupplier, DEFAULT_CAPABILITIES } = require("../flightSupplier.interface");
 
 const NOT_READY = (method) => () => {
   throw new Error(
@@ -37,6 +37,8 @@ class NigerianDomesticAdapter extends FlightSupplier {
     super();
     this.config = config; // intentionally unused until a real supplier is contracted
   }
+
+  get capabilities() { return DEFAULT_CAPABILITIES; }
 
   resolveLocation = NOT_READY("resolveLocation");
   search = NOT_READY("search");

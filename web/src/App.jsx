@@ -67,7 +67,7 @@ export default function App() {
     <SessionContext.Provider value={{ api, principal, signOut, refreshPrincipal }}>
       <div className="app">
         <aside className="sidebar">
-          <div className="brand"><span className="dot"><Icon name="plane" size={16} /></span>TAPI Agent</div>
+          <div className="brand"><img className="brand-mark" src="/tapi-logo.jpeg" alt="TAPI" /><span>TAPI Agent</span></div>
           {nav.map(([id, label, icon, to]) => <button key={id} className="navlink" aria-current={section === id ? "page" : undefined} onClick={() => go(to)}><Icon name={icon} />{label}</button>)}
           <div className="spacer" />
           <div className="userbox"><strong>{principal.fullName}</strong>{principal.type === "session" ? `${ROLE_LABEL[principal.role]} · ${principal.agencyName}` : "Agency admin"}</div>

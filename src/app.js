@@ -23,8 +23,14 @@ const db = require("./db");
 const path = require("path");
 const { getSupplierHealth } = require("./services/supplierRegistry");
 
+// Fail at startup, not on the first request, when a production secret is missing.
+if (process.env.NODE_ENV === "production") { require("./services/internalAuth").getServiceToken(); require("./services/fieldCrypto").getFieldCrypto(); }
+
 const app = express();
-app.set("trust proxy", true); // req.ip reflects the real client behind a load balancer, not the LB itself
+// req.ip must reflect the real client, but `true` trusts every X-Forwarded-For hop, so any client could spoof its IP and dodge the per-IP
+// limiters (login brute-force guard). Trust exactly TRUST_PROXY hops (default 1: one load balancer, e.g. Render). Use 0 when exposed directly.
+const trustHops = process.env.TRUST_PROXY === undefined || process.env.TRUST_PROXY === "" ? 1 : Number(process.env.TRUST_PROXY);
+app.set("trust proxy", Number.isInteger(trustHops) && trustHops >= 0 ? trustHops : 1);
 app.use(helmet());
 app.use(cors({ origin: (process.env.ALLOWED_ORIGINS || "").split(",").filter(Boolean) }));
 app.use(requestContext); // correlation ID + structured request logging (Master Spec §19), before anything else

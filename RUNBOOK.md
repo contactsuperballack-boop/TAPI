@@ -146,3 +146,33 @@ Genuinely missing operational capability, not just missing documentation:
 
 These need real infrastructure decisions (which APM, which log pipeline, backup cadence) before
 a runbook entry for them means anything.
+
+## Booking poller (Sprint 10.0)
+
+Asynchronous suppliers (LetsFG now, Tiqwa later) only *accept* a booking; the outcome arrives later.
+
+```
+npm run poll:bookings              # loops every BOOKING_POLL_INTERVAL_MS (default 15s)
+node src/scripts/pollBookings.js --once   # single pass (cron / scheduled job)
+```
+
+- One poller at a time (Postgres advisory lock `875309002`); a second instance exits immediately.
+- A failed supplier call (timeout, DNS) changes nothing: the booking is retried with backoff (15s → 15min cap).
+- Only a supplier-completed state **with a PNR/ticket reference** becomes `confirmed`. "Completed" with no reference goes to `reconciliation_required`.
+- After `BOOKING_MAX_POLL_ATTEMPTS` (default 40) without a terminal state the booking is escalated to `reconciliation_required` and an audit event is written. A human owns it from there.
+- `ticketing_pending` = reservation held, ticket not issued. Never tell a traveller it is booked.
+- `npm run reconcile` now resolves flight bookings through the same shared sync.
+
+## Interrupted submissions and the outbox (Sprint 10.4)
+
+- A booking in `reconciliation_required` whose latest transition reason says "submission outcome unknown" was interrupted around the supplier call. Its `submission_key` (`tapi-bk-<id>`, also in the transition metadata) is what the supplier saw. Check the supplier for that key **before** anything else. If a booking exists, attach its id; if not, mark `failed` and let the customer retry. Never re-submit while unsure.
+- `npm run outbox:dispatch` (or `-- --once`). Dead-lettered events: `SELECT * FROM booking_outbox WHERE dead_at IS NOT NULL;`. Fix the cause, then clear `dead_at` and set `available_at = now()` to retry.
+- Advisory locks: reconcile `875309001`, poller `875309002`, outbox `875309003`.
+
+## Money: ledger and settlement (Sprint 10.6)
+
+- `npm run settle:sweep` (or `-- --once`). Re-drives in-doubt captures/voids/refunds with the SAME idempotency key (safe) and flags authorisations about to lapse while bookings are unresolved (audit action `SETTLEMENT_ESCALATION`).
+- Who owes whom for a payment: `SELECT kind, amount_minor, created_at FROM ledger_entries WHERE payment_id = '<id>' ORDER BY created_at;` Completed money movement is `authorization`, `capture`, `void`, `refund`. `*_requested` without a matching completion means in doubt.
+- The ledger cannot be edited (trigger). Corrections are new entries, never updates.
+- `capture_failed`: the booking stays confirmed. Contact the customer/provider; once resolved, a human re-drives the capture or refunds. Never re-capture without checking the provider for the idempotency key first.
+- Advisory locks: reconcile `875309001`, poller `875309002`, outbox `875309003`, settlement `875309004`.

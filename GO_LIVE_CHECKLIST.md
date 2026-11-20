@@ -170,3 +170,63 @@ For each phase, the useful signal is: **exact request/response, not just pass/fa
 search 404s, the actual response body tells us whether it's a wrong path (easy fix) or a wrong
 auth scheme (bigger fix). Bring back real payloads, not summaries — that's what turns the
 `UNVERIFIED` comments throughout the adapters into confirmed, correct code.
+
+
+## Sprint 9.1 LetsFG environment safety
+
+- Set `LETSFG_AUTH_MODE=developer` and `LETSFG_ENVIRONMENT=sandbox` for integration testing.
+- The same LetsFG key is used for both environments; sandbox can be called without a key, but a supplied key must be valid.
+- Sandbox flight search uses `POST /developers/api/v1/sandbox/flights/search`; it is synchronous. TAPI stores the normalized response snapshot in the `supplier_search_ref` field for restart-safe polling.
+- Do not set `LETSFG_ENVIRONMENT=production` until search response mapping, account readiness, payment, passenger data and booking workflows are verified.
+- Hotel calls are blocked in sandbox because LetsFG does not document a hotel sandbox. Do not route hotel requests to production while the environment is set to sandbox.
+- TAPI flight booking remains deliberately gated until the full passenger schema and supplier booking-question workflow are implemented.
+
+---
+
+## Sprint 10.0 additions (supplier abstraction + poller)
+
+- [ ] `npm run migrate` applies `018_supplier_agnostic_polling.sql` on a disposable DB; confirm `searches.supplier_code`, `bookings.supplier_booking_id`, `poll_attempts`, `next_poll_at` exist and the status CHECK includes `ticketing_pending`
+- [ ] `npm run poll:bookings -- --once` against sandbox: an async booking moves `processing` → `confirmed` only when a PNR is returned
+- [ ] Kill the poller mid-pass; restart; no booking double-processed (advisory lock) and none lost
+- [ ] Sandbox scenarios `needs_attention` and `seller_failed` land in `reconciliation_required` / `failed`, never `confirmed`
+- [ ] Confirmed booking keeps the supplier booking id in `supplier_booking_id` and the PNR in `supplier_reference`
+- [ ] Production: `sandboxScenario` in a booking request is rejected with 400
+- [ ] Tiqwa stays `TIQWA_ENABLED=false` until its API is verified and contracted
+
+## Sprint 10.4 additions (crash window + outbox)
+
+- [ ] Migration 019 applies cleanly; `booking_outbox` and the new `bookings` columns exist
+- [ ] Kill the API between `beginSubmission` and the supplier response (sandbox): booking stays `pending`, recovery escalates it after the orphan window, **no second supplier booking is created**
+- [ ] Kill the API after the supplier accepts but before `recordSupplierAcceptance`: same result
+- [ ] A `confirmed` transition produces exactly one `booking_outbox` row; killing the dispatcher mid-batch re-delivers after the lease lapses
+- [ ] Ask LetsFG in writing: does `idempotency_key` on `/flights/book` replay the original booking, and is there a lookup by key?
+- [ ] Hotels and buses still need submission intent before go-live for those verticals
+
+## Sprint 10.5 additions (CI)
+
+- [ ] Repository created; workflows run on the first push; record which jobs are red and why (this is the real baseline)
+- [ ] Branch protection: require `unit`, `integration`, `web` before merge
+- [ ] `LETSFG_API_KEY` stored only as a repository secret; run `LetsFG sandbox smoke (manual)` for `success`, `needs_attention`, `seller_failed`
+- [ ] `npm audit` findings reviewed and the audit step made blocking once the baseline is clean
+- [ ] Generate and commit `web/package-lock.json`; rebuild `web/dist` from current source
+
+## Sprint 10.6 additions (money)
+
+- [ ] Migration 020 applies; backfilled ledger entries equal `payments.captured_minor` for every historical captured payment
+- [ ] `UPDATE`/`DELETE` on `ledger_entries` is rejected in the target database
+- [ ] With the mock provider: authorise → confirm booking → capture once; fail booking → void; mixed outcome → partial capture; kill the dispatcher mid-capture → no double capture
+- [ ] Inject a provider timeout on refund: payment stays in doubt, sweep completes it once
+- [ ] Product Owner decisions recorded: authorised-counts-as-secured, fee allocation on partial failure, FX buffer/source, `capture_failed` ownership
+- [ ] A real payment provider with `authorizeCapture` is chosen and its capability flags verified, not assumed
+- [ ] `FX_STATIC_RATES` unset in production (the static provider throws there by design)
+
+## Sprint 10.7 additions (failure scenarios)
+
+- [ ] Migration 021 applies on the target database (fails if duplicate live bookings per offer already exist; resolve first)
+- [ ] R02 manual: kill the API process between `beginSubmission` and the supplier response; then after the supplier accepts but before acceptance is saved. Expect: one supplier booking, booking escalated or recovered, never resubmitted
+- [ ] R03 manual: block DNS to the supplier in sandbox; expect `reconciliation_required` and no duplicate on retry
+- [ ] R05 manual: fire 20 identical booking requests at once; expect exactly one supplier booking
+- [ ] New idempotency key for an offer with an ambiguous booking returns 409 `BOOKING_IN_PROGRESS_FOR_OFFER`
+- [ ] R15: run a 1,000-booking poll against Postgres and a stub supplier; record connection count, memory and time (no target is claimed)
+- [ ] Apply the fail-safe classifier (`classifyBookingOutcome`) to hotels and buses before enabling those verticals
+- [ ] Decide deliberately: rate limiter fails closed (503) when its store is down

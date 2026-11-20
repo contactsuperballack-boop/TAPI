@@ -19,7 +19,36 @@ class MockPaymentProvider extends PaymentProvider {
     this.baseUrl = baseUrl;
   }
 
-  async createCheckout({ orderId, amount, currency, idempotencyKey }) {
+  get capabilities() { return { authorizeCapture: true, partialCapture: true, partialRefund: true, void: true }; }
+
+  // Test/failure-injection hook: provider.injectFault("capture", { definitive: false, times: 1 }) makes the next
+  // `times` calls to that method throw. definitive=false models a timeout (outcome unknown).
+  injectFault(method, { definitive = false, times = 1, message = "injected fault" } = {}) {
+    this._faults = this._faults || {};
+    this._faults[method] = { definitive, times, message };
+  }
+  _maybeFault(method) {
+    const f = this._faults && this._faults[method];
+    if (f && f.times > 0) { f.times--; const e = new Error(f.message); e.definitive = f.definitive; throw e; }
+  }
+  _once(method, key, fn) {
+    this._memo = this._memo || new Map();
+    const k = `${method}:${key}`;
+    if (!this._memo.has(k)) this._memo.set(k, fn());
+    return this._memo.get(k); // idempotent by key, like a real provider
+  }
+
+  async capture({ providerRef, amountMinor, idempotencyKey }) {
+    this._maybeFault("capture");
+    return this._once("capture", idempotencyKey, () => ({ status: "captured", providerRef, capturedMinor: amountMinor }));
+  }
+
+  async void({ providerRef, idempotencyKey }) {
+    this._maybeFault("void");
+    return this._once("void", idempotencyKey, () => ({ status: "voided", providerRef }));
+  }
+
+  async createCheckout({ orderId, amount, currency, idempotencyKey, captureMode = "automatic" }) {
     const providerRef = `mock_pay_${crypto.randomBytes(12).toString("hex")}`;
     return {
       providerRef,
@@ -44,7 +73,7 @@ class MockPaymentProvider extends PaymentProvider {
     const data = JSON.parse(rawBody);
     return {
       providerRef: data.provider_ref,
-      status: data.status, // 'captured' | 'failed'
+      status: data.status, // 'authorized' | 'captured' | 'failed'
       amount: data.amount,
       currency: data.currency,
       // Real providers give a stable event id per event, unchanged across
@@ -52,11 +81,13 @@ class MockPaymentProvider extends PaymentProvider {
       // Optional here since the mock provider's test fixtures predate this
       // field; a real adapter should always populate it.
       eventId: data.event_id || null,
+      authorizationExpiresAt: data.authorization_expires_at ? new Date(data.authorization_expires_at) : null,
     };
   }
 
-  async refund({ providerRef, amount }) {
-    return { status: "refunded", providerRef, refundedAmount: amount };
+  async refund({ providerRef, amount, amountMinor, idempotencyKey }) {
+    this._maybeFault("refund");
+    return this._once("refund", idempotencyKey || `${providerRef}:${amount}`, () => ({ status: "refunded", providerRef, refundedAmount: amount, refundedMinor: amountMinor }));
   }
 }
 

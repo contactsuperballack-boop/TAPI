@@ -21,6 +21,10 @@ export function blockedMessage(b) {
     case "PROFILE_INCOMPLETE": return `${(b && b.detail) || "Traveller details are missing."} Nothing was booked.`;
     case "EMAIL_NOT_VERIFIED": return "Confirm your email address first. Use the link we sent you. Nothing was booked.";
     case "SELF_BOOKING_DISABLED": return "This agency completes bookings for its clients. Choose \"Have an agent book it\".";
+    case "BOOKING_UNCONFIRMED": return (b && b.detail) || "We could not confirm this booking yet. Please do not approve it again.";
+    case "BOOKING_FAILED": return (b && b.detail) || "The supplier did not accept this booking. Nothing was booked.";
+    case "SUPPLIER_UNAVAILABLE": return "We could not reach the supplier just now. Nothing was booked and your approval is still valid. Try again in a moment.";
+    case "NOT_UNDER_REVIEW": return "This booking is no longer under review.";
     case "HANDLED_BY_AGENT": return "This booking was sent to an agent, so it cannot be booked automatically.";
     case "ALREADY_STARTED": return "An agent has already started on this, so it cannot be withdrawn. Wait for their update.";
     default: return (b && (b.detail || b.title)) || "The booking could not be started. Nothing was charged.";
@@ -69,7 +73,32 @@ function ApproveSheet({ item, onClose, onConfirm, busy, consentNeeded, forceAgen
   );
 }
 
-function ItemCard({ item, canBook, onApprove, onBook, onRefresh, onWithdraw, busy, canApprove, approveHint }) {
+function ResolveSheet({ item, onClose, onDone, api, tripId }) {
+  const [outcome, setOutcome] = useState("confirmed"); const [ref, setRef] = useState(""); const [note, setNote] = useState("");
+  const [st, setSt] = useState({ busy: false, error: null });
+  async function submit(e) {
+    e.preventDefault(); setSt({ busy: true, error: null });
+    try { await api.resolveItem(tripId, item.id, { outcome, reference: outcome === "confirmed" ? ref : undefined, note: note || undefined }); onDone(outcome); }
+    catch (ex) { setSt({ busy: false, error: errText(ex) }); }
+  }
+  return (
+    <Sheet title="Resolve this booking" onClose={onClose}>
+      <form className="stack" onSubmit={submit}>
+        {st.error && <Banner>{st.error}</Banner>}
+        <p className="sub" style={{ margin: 0 }}>We could not confirm this booking automatically. Check with the supplier, then record what you found. This does not book anything.</p>
+        <fieldset className="choice" aria-label="Outcome">
+          <label className={`opt${outcome === "confirmed" ? " on" : ""}`}><input type="radio" name="oc" checked={outcome === "confirmed"} onChange={() => setOutcome("confirmed")} /><span><strong>It was booked at the supplier</strong><span className="sub">Needs the supplier's confirmation reference.</span></span></label>
+          <label className={`opt${outcome === "not_booked" ? " on" : ""}`}><input type="radio" name="oc" checked={outcome === "not_booked"} onChange={() => setOutcome("not_booked")} /><span><strong>It was not booked</strong><span className="sub">The traveller is told and can approve again.</span></span></label>
+        </fieldset>
+        {outcome === "confirmed" && <Field label="Supplier confirmation reference" id="rv-r"><input id="rv-r" className="input" value={ref} onChange={(e) => setRef(e.target.value)} maxLength={80} required /></Field>}
+        <Field label="Note (optional)" id="rv-n"><textarea id="rv-n" className="textarea" value={note} onChange={(e) => setNote(e.target.value)} maxLength={500} /></Field>
+        <button className="btn primary block" disabled={st.busy || (outcome === "confirmed" && !ref.trim())}>{st.busy ? "Saving…" : "Save outcome"}</button>
+      </form>
+    </Sheet>
+  );
+}
+
+function ItemCard({ item, canBook, onApprove, onBook, onRefresh, onWithdraw, onRetry, onResolve, isStaff, busy, canApprove, approveHint }) {
   const d = describeItem(item); const st = itemStatusMeta(item.status); const pl = priceLabelMeta(item.price_label);
   const left = minutesLeft(item.approval_expires_at);
   const approvedLive = item.status === "approved" && item.approval_id;
@@ -86,6 +115,7 @@ function ItemCard({ item, canBook, onApprove, onBook, onRefresh, onWithdraw, bus
       {item.status === "approved" && !item.approval_id && <div className="sub">The approval timed out. Approve again to continue.</div>}
       {item.booking_id && <div className="sub num">Booking reference: {item.booking_id}</div>}
       {item.confirmation_ref && <div className="sub num">Confirmation: <strong>{item.confirmation_ref}</strong></div>}
+      {item.status === "reconciliation_required" && <div className="sub">We could not confirm this booking yet. Please do not approve it again: we are checking so you are not booked twice.</div>}
       {item.status === "agent_requested" && <div className="sub">Waiting for an agent to pick this up. You will get an email when it is done.</div>}
       {item.status === "agent_working" && <div className="sub">{item.request_agent_name ? `${item.request_agent_name} is` : "An agent is"} booking this now.</div>}
       {item.status === "failed" && item.request_decline_reason && <div className="sub">Your agent could not book this: {item.request_decline_reason}. Nothing was booked.</div>}
@@ -97,6 +127,8 @@ function ItemCard({ item, canBook, onApprove, onBook, onRefresh, onWithdraw, bus
         {approvedLive && <button className="btn primary" disabled={busy || !canBook} onClick={() => onBook(item)}>{busy ? "Booking…" : "Book now"}</button>}
         {approvedLive && !canBook && <span className="sub">Choose a traveller above to book.</span>}
         {item.status === "agent_requested" && <button className="btn" disabled={busy} onClick={() => onWithdraw(item)}>Withdraw request</button>}
+        {item.status === "reconciliation_required" && item.retry_approval_id && <button className="btn primary" disabled={busy} onClick={() => onRetry(item)}>{busy ? "Checking…" : "Try confirming again"}</button>}
+        {item.status === "reconciliation_required" && isStaff && <button className="btn" disabled={busy} onClick={() => onResolve(item)}>Resolve this booking</button>}
         {item.booking_id && ["booking", "action_required", "reconciliation_required", "confirmed"].includes(item.status) && <button className="btn" disabled={busy} onClick={() => onRefresh(item)}><Icon name="refresh" size={17} />Check status</button>}
       </div>
     </article>
@@ -112,6 +144,7 @@ export function TripView({ api, tripId, go, onAuthError }) {
   const [approving, setApproving] = useState(null);
   const [busyId, setBusyId] = useState(null);
   const [events, setEvents] = useState(null);
+  const [resolving, setResolving] = useState(null);
 
   useEffect(() => { if (tab === "activity") api.events(tripId).then(setEvents).catch(() => setEvents([])); }, [tab, tripId, api, trip]);
 
@@ -133,10 +166,10 @@ export function TripView({ api, tripId, go, onAuthError }) {
     catch (ex) { setApproving(null); flash("bad", ex.code === "PRICE_MISMATCH" ? "The price changed while you were reviewing. Review the new price and try again." : blockedMessage({ ...ex.body, code: ex.code })); await reload(); }
     finally { setBusyId(null); }
   }
-  async function book(item) {
+  async function book(item, approvalId = item.approval_id) {
     setBusyId(item.id); setNotice(null);
-    try { const r = await api.book(trip.id, item.id, item.approval_id); flash("ok", `Booking started (${r.status}). Check the status for updates.`); }
-    catch (ex) { flash(ex.status === 409 || ex.status === 400 || ex.status === 403 ? "warn" : "bad", blockedMessage({ ...ex.body, code: ex.code, currency: item.currency })); }
+    try { const r = await api.book(trip.id, item.id, approvalId); flash("ok", `Booking started (${r.status}). Check the status for updates.`); }
+    catch (ex) { flash([400, 403, 409, 502, 503].includes(ex.status) ? "warn" : "bad", blockedMessage({ ...ex.body, code: ex.code, currency: item.currency })); }
     finally { setBusyId(null); await reload(); }
   }
   async function refresh(item) {
@@ -151,7 +184,7 @@ export function TripView({ api, tripId, go, onAuthError }) {
   }
   async function pickTraveller(e) { try { await api.patchTrip(trip.id, { travelerId: e.target.value }); await reload(); } catch (ex) { flash("bad", errText(ex)); } }
 
-  const EV = { item_proposed: "Added an offer to the trip", item_approved: "Approved an item", agent_requested: "Sent to an agent", agent_claimed: "An agent picked this up", agent_released: "An agent handed this back to the queue", agent_completed: "An agent completed the booking", agent_declined: "An agent could not book this", agent_repriced: "An agent asked for a new price approval", agent_request_withdrawn: "Request withdrawn", booking_started: "Booking started", booking_blocked: "Booking stopped before any charge", trip_updated: "Trip updated" };
+  const EV = { item_proposed: "Added an offer to the trip", item_approved: "Approved an item", agent_requested: "Sent to an agent", agent_claimed: "An agent picked this up", agent_released: "An agent handed this back to the queue", agent_completed: "An agent completed the booking", agent_declined: "An agent could not book this", agent_repriced: "An agent asked for a new price approval", agent_request_withdrawn: "Request withdrawn", booking_started: "Booking started", booking_blocked: "Booking stopped before any charge", booking_unconfirmed: "Booking could not be confirmed and is under review", booking_failed: "The supplier did not accept the booking", booking_resolved: "A person closed out a booking that was under review", trip_updated: "Trip updated" };
 
   return (
     <div className="stack">
@@ -188,12 +221,13 @@ export function TripView({ api, tripId, go, onAuthError }) {
 
       {tab === "plan" && (items.length === 0
         ? <Empty title="Nothing in this trip yet" action={<button className="btn primary" onClick={() => setTab("find")}>Find flights and hotels</button>}>Search, add what you like, then approve each booking yourself.</Empty>
-        : <div className="stack">{items.map((i) => <ItemCard key={i.id} item={i} busy={busyId === i.id} canBook={!!trip.traveler_id} canApprove={canApprove} approveHint={approveHint} onApprove={setApproving} onBook={book} onRefresh={refresh} onWithdraw={withdraw} />)}</div>)}
+        : <div className="stack">{items.map((i) => <ItemCard key={i.id} item={i} busy={busyId === i.id} canBook={!!trip.traveler_id} canApprove={canApprove} approveHint={approveHint} onApprove={setApproving} onBook={book} onRefresh={refresh} onWithdraw={withdraw} onRetry={(it) => book(it, it.retry_approval_id)} onResolve={setResolving} isStaff={!trav} />)}</div>)}
       {tab === "find" && <SearchPanel api={api} trip={trip} items={items} onAdded={reload} />}
       {tab === "assistant" && <ChatPanel api={api} trip={trip} onChanged={reload} />}
       {tab === "activity" && (events === null ? <Loading n={2} /> : events.length === 0 ? <Empty title="No activity yet">Approvals, bookings and changes will appear here.</Empty>
         : <div className="timeline">{events.map((e) => <div key={e.id}><strong>{EV[e.type] || e.type}</strong><div className="sub">{formatDate(e.created_at, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}{e.payload && e.payload.reason ? ` · ${e.payload.reason}` : ""}</div></div>)}</div>)}
 
+      {resolving && <ResolveSheet item={resolving} api={api} tripId={trip.id} onClose={() => setResolving(null)} onDone={(o) => { setResolving(null); flash("ok", o === "confirmed" ? "Marked as booked. The traveller has been emailed." : "Marked as not booked. The traveller can approve it again."); reload(); }} />}
       {approving && <ApproveSheet item={approving} busy={busyId === approving.id} consentNeeded={needsConsent(principal)} forceAgent={selfBookingOff} onClose={() => setApproving(null)} onConfirm={confirmApprove} />}
     </div>
   );

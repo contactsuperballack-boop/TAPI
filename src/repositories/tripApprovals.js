@@ -17,7 +17,7 @@ const TripApprovals = {
   // while unexpired. Returns the row, or null if someone else got there first.
   async consume(id, agencyId) {
     const { rows } = await db.query(
-      `UPDATE agent_trip_approvals SET status='consumed'
+      `UPDATE agent_trip_approvals SET status='consumed', consumed_at=now()
         WHERE id=$1 AND agency_id=$2 AND status='active' AND expires_at > now()
         RETURNING *`,
       [id, agencyId]

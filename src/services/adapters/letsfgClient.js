@@ -9,17 +9,24 @@ const { Errors } = require("../../domain/errors");
 const { CircuitBreaker } = require("../../domain/circuitBreaker");
 
 class LetsFGClient {
-  constructor({ authMode, bearerToken, apiKey, baseUrl = "https://letsfg.co", timeoutMs, breaker } = {}) {
+  constructor({ authMode, bearerToken, apiKey, baseUrl = "https://letsfg.co", environment = "production", timeoutMs, breaker } = {}) {
     this.authMode = authMode; // 'pfs' | 'developer'
+    this.environment = environment; // 'sandbox' | 'production'
     this.bearerToken = bearerToken;
     this.apiKey = apiKey;
-    this.baseUrl = baseUrl;
+    this.baseUrl = String(baseUrl).replace(/\/$/, "");
+    if (!["sandbox", "production"].includes(this.environment)) {
+      throw new Error("LETSFG_ENVIRONMENT must be 'sandbox' or 'production'");
+    }
+    if (this.environment === "sandbox" && authMode !== "developer") {
+      throw new Error("LetsFG sandbox requires LETSFG_AUTH_MODE=developer");
+    }
 
     if (authMode === "pfs" && !bearerToken) {
       throw new Error("LETSFG_BEARER_TOKEN is required when LETSFG_AUTH_MODE=pfs");
     }
-    if (authMode === "developer" && !apiKey) {
-      throw new Error("LETSFG_API_KEY is required when LETSFG_AUTH_MODE=developer");
+    if (authMode === "developer" && !apiKey && this.environment !== "sandbox") {
+      throw new Error("LETSFG_API_KEY is required for production Developer API requests");
     }
 
     // Sprint 2 hardening: previously no timeout at all — a hung LetsFG
@@ -46,9 +53,18 @@ class LetsFGClient {
   }
 
   _headers() {
-    return this.authMode === "pfs"
-      ? { Authorization: `Bearer ${this.bearerToken}`, "Content-Type": "application/json" }
-      : { "X-API-Key": this.apiKey, "Content-Type": "application/json" };
+    const headers = { "Content-Type": "application/json" };
+    if (this.authMode === "pfs") headers.Authorization = `Bearer ${this.bearerToken}`;
+    if (this.apiKey) headers["X-API-Key"] = this.apiKey;
+    return headers;
+  }
+
+  developerPath(resource) {
+    const clean = String(resource).replace(/^\/+/, "");
+    const prefix = this.environment === "sandbox"
+      ? "/developers/api/v1/sandbox/"
+      : "/developers/api/v1/";
+    return `${prefix}${clean}`;
   }
 
   async request(method, path, body) {
@@ -79,8 +95,21 @@ class LetsFGClient {
       throw Errors.SupplierTimeout(`LetsFG timed out on ${path}`);
     }
     if (!res.ok) {
-      const text = await res.text().catch(() => "");
-      throw Errors.SupplierUnavailable(`LetsFG ${res.status} on ${path}: ${text.slice(0, 300)}`);
+      const bodyText = await res.text().catch(() => "");
+      let supplierBody = {};
+      try { supplierBody = bodyText ? JSON.parse(bodyText) : {}; } catch (_) { /* retain bounded text only */ }
+      const message = supplierBody.message || supplierBody.error || bodyText.slice(0, 300) || `HTTP ${res.status}`;
+      // A supplier 4xx refusal (e.g. missing_fields / payment_declined)
+      // is definitive; a 5xx remains ambiguous because the supplier may
+      // have accepted the mutation before failing to respond.
+      if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+        const err = new Error(`LetsFG ${res.status} on ${path}: ${String(message).slice(0, 300)}`);
+        err.code = "SUPPLIER_REJECTED";
+        err.httpStatus = res.status;
+        err.supplierError = supplierBody;
+        throw err;
+      }
+      throw Errors.SupplierUnavailable(`LetsFG ${res.status} on ${path}: ${String(message).slice(0, 300)}`);
     }
     return res.json();
   }

@@ -836,4 +836,23 @@ curl -X POST http://localhost:8525/v1/buses/search \
 ```
 
 The mock supplier is intentionally a development adapter. Before real bookings, implement a production `BusSupplier` adapter and verify supplier-specific search, seat-hold, booking, cancellation, and reconciliation semantics in sandbox credentials.
-"# TAPI" 
+
+## LetsFG sandbox end-to-end smoke test
+
+The flight sandbox mirrors the documented Developer API booking lifecycle and does not hold or charge money. The smoke test uses synthetic passenger data and calls only `/developers/api/v1/sandbox/*`.
+
+```bash
+# Keep this environment explicit. The sandbox supports calls without a key.
+LETSFG_ENVIRONMENT=sandbox npm run letsfg:sandbox-smoke
+
+# Exercise deterministic supplier scenarios:
+LETSFG_ENVIRONMENT=sandbox LETSFG_SANDBOX_SCENARIO=price_change npm run letsfg:sandbox-smoke
+LETSFG_ENVIRONMENT=sandbox LETSFG_SANDBOX_SCENARIO=extra npm run letsfg:sandbox-smoke
+LETSFG_ENVIRONMENT=sandbox LETSFG_SANDBOX_SCENARIO=seller_failed npm run letsfg:sandbox-smoke
+LETSFG_ENVIRONMENT=sandbox LETSFG_SANDBOX_SCENARIO=needs_attention npm run letsfg:sandbox-smoke
+LETSFG_ENVIRONMENT=sandbox LETSFG_SANDBOX_SCENARIO=payment_declined npm run letsfg:sandbox-smoke
+```
+
+Optional settings: `LETSFG_API_KEY` (must be the current valid key if supplied), `LETSFG_SANDBOX_SPEED=fast|realistic`, `LETSFG_WANT_SEAT=true`, `LETSFG_SMOKE_ORIGIN=LOS`, `LETSFG_SMOKE_DESTINATION=LHR`, `LETSFG_SMOKE_DATE=YYYY-MM-DD`, `LETSFG_SMOKE_POLL_MS=5000`, and `LETSFG_SMOKE_MAX_WAIT_MS=180000`. The default passenger is synthetic and must never be replaced with a real customer's passport data in a smoke test.
+
+A successful `success` scenario must finish in `completed` with a sandbox PNR. `seller_failed` must finish in `needs_attention` with `manual_booking=true`; do not open another booking in that state. `payment_declined`, `payment_method_required`, and `temporarily_unavailable` are expected start-call refusals and are reported as expected outcomes. Run scenarios one at a time. This script tests the supplier contract directly; it does not replace the TAPI API + PostgreSQL + browser integration suite.

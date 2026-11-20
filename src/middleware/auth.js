@@ -16,7 +16,7 @@ const { isServiceToken, fromLoopback } = require("../services/internalAuth");
 const { travellerMayCall } = require("../domain/access");
 const { Identity } = require("../repositories/identity");
 
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const { UUID } = require("../domain/ids");
 
 async function authenticate(req, res, next) {
   try {

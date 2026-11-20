@@ -8,6 +8,7 @@ const STATES = [
   "created",              // row exists, nothing sent to the supplier yet
   "pending",              // supplier call in flight, or async job started
   "processing",           // supplier acknowledged, working on it (e.g. hotel job)
+  "ticketing_pending",    // reservation/PNR held, ticket NOT yet issued (GDS-style suppliers) — never shown as booked
   "confirmed",            // supplier gave a real reference — see requiresSupplierReference
   "action_required",      // supplier handed back a checkout URL, no reference yet
   "price_changed",        // supplier repriced the offer during validate/book
@@ -26,8 +27,9 @@ const TERMINAL_STATES = new Set(["failed", "cancelled", "refunded"]);
 // statuses it's legal to move to. Anything not listed here is rejected.
 const TRANSITIONS = {
   created: ["pending", "failed"],
-  pending: ["processing", "confirmed", "action_required", "price_changed", "failed", "reconciliation_required"],
-  processing: ["confirmed", "action_required", "price_changed", "failed", "reconciliation_required"],
+  pending: ["processing", "ticketing_pending", "confirmed", "action_required", "price_changed", "failed", "reconciliation_required"],
+  processing: ["ticketing_pending", "confirmed", "action_required", "price_changed", "failed", "reconciliation_required"],
+  ticketing_pending: ["confirmed", "cancelled", "failed", "reconciliation_required"], // ticket issued -> confirmed; reservation voided/lapsed -> cancelled/failed
   action_required: ["confirmed", "cancelled", "failed"], // customer completes checkout -> confirmed; abandons -> cancelled/failed
   price_changed: ["pending", "cancelled", "failed"], // re-quote and retry, or give up
   reconciliation_required: ["confirmed", "failed", "cancelled"], // resolved by scripts/reconcile.js or manual operator action
@@ -73,7 +75,7 @@ function isTerminal(status) {
 }
 
 /** Statuses a stuck-booking detector should treat as "shouldn't sit here indefinitely." */
-const INTERMEDIATE_STATES = ["pending", "processing", "reconciliation_required", "cancel_requested", "refund_pending"];
+const INTERMEDIATE_STATES = ["pending", "processing", "ticketing_pending", "reconciliation_required", "cancel_requested", "refund_pending"];
 
 module.exports = {
   STATES,

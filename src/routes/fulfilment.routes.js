@@ -16,7 +16,7 @@ const router = express.Router();
 const bad = (d) => new ApiError("VALIDATION_ERROR", 400, "Invalid request", d);
 const notifier = () => createNotifier({ getMailer: () => getMailer(), baseUrl: process.env.PUBLIC_APP_URL || `http://localhost:${process.env.PORT || 3000}` });
 const actor = (req) => req.principal.actor || "api_key";
-const UUID = /^[0-9a-f-]{36}$/i;
+const { isUuid } = require("../domain/ids");
 
 const view = (r) => ({
   id: r.id, status: r.status, tripId: r.trip_id, tripTitle: r.trip_title, itemId: r.trip_item_id, itemKind: r.item_kind, item: r.item_details || {},
@@ -27,7 +27,7 @@ const view = (r) => ({
 });
 
 async function load(req) {
-  if (!UUID.test(req.params.id)) throw Errors.NotFound("Request");
+  if (!isUuid(req.params.id)) throw Errors.NotFound("Request");
   const r = await Fulfilment.get(req.params.id, req.tenant.agencyId);
   if (!r) throw Errors.NotFound("Request");
   return r;
@@ -67,7 +67,7 @@ router.post("/:id/claim", async (req, res, next) => {
 router.post("/:id/release", async (req, res, next) => {
   try {
     const r = await load(req); mustWork(req, r);
-    await Fulfilment.release(r.id, r.agency_id);
+    if (!(await Fulfilment.release(r.id, r.agency_id, r.claimed_by_user_id))) throw new ApiError("NOT_CLAIMED", 409, "Changed", "This request changed while you were working on it. Reload and check its status.");
     await Trips.event(r.agency_id, r.trip_id, "agent_released", { requestId: r.id, by: actor(req) });
     res.json(view(await Fulfilment.get(r.id, r.agency_id)));
   } catch (err) { next(err); }

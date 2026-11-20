@@ -24,7 +24,11 @@ const { executeApprovedBooking } = require("../agent/bookingExecutor");
 const { createTapiClient } = require("../agent/tapiClient");
 const { getServiceToken } = require("../services/internalAuth");
 const { syncTripStatus } = require("../services/tripSync");
+const { classifyBookingFailure, failureMessage } = require("../domain/bookingFailure");
+const { createNotifier } = require("../services/notify");
+const { getMailer } = require("../services/mailer");
 const { requireIdempotencyKey } = require("../middleware/idempotency");
+const { requireRole } = require("../middleware/auth");
 
 const router = express.Router();
 const bad = (detail) => new ApiError("VALIDATION_ERROR", 400, "Invalid request", detail);
@@ -204,7 +208,31 @@ router.post("/:tripId/items/:itemId/book", requireIdempotencyKey, async (req, re
       ? { passengers: [{ firstName: party.first_name, lastName: party.last_name, dateOfBirth: party.date_of_birth, passportNumber: party.passport_number, nationality: party.nationality }], contact: { email: party.email, phone: party.phone || undefined } }
       : { guests: [{ firstName: party.first_name, lastName: party.last_name }], contact: { email: party.email, phone: party.phone || undefined } };
 
-    const result = await executeApprovedBooking({ agencyId, approvalId, kind: item.kind, bookingBody }, { approvals: TripApprovals, tapi: internalTapi(req) });
+    let result;
+    try {
+      result = await executeApprovedBooking({ agencyId, approvalId, kind: item.kind, bookingBody }, { approvals: TripApprovals, tapi: internalTapi(req) });
+    } catch (err) {
+      // Nothing was spent (e.g. the supplier was down while validating): tell the caller to try again; item and approval are untouched.
+      if (!err.afterConsume) throw new ApiError("SUPPLIER_UNAVAILABLE", 503, "Try again shortly", "We could not reach the supplier. Nothing was booked and your approval is still valid.");
+      // The approval is spent. Either the supplier definitively refused (back to the traveller / failed) or we cannot tell (hold for review).
+      const c = classifyBookingFailure(err);
+      await Trips.event(agencyId, trip.id, c.kind === "definitive" ? "booking_failed" : "booking_unconfirmed", { itemId: item.id, code: c.code, httpStatus: c.status, by: req.principal.actor });
+      if (c.kind === "definitive") await Trips.reopenItem(item.id, agencyId, { status: c.itemStatus, priceLabel: "unverified" });
+      else await Trips.setItemStatus(item.id, agencyId, "reconciliation_required");
+      await advanceTrip(trip, "booking"); // a trip must pass through booking before it can need attention
+      await syncTripStatus(agencyId, trip.id);
+      if (c.kind === "definitive" && party.email) createNotifier({ getMailer: () => getMailer(), baseUrl: process.env.PUBLIC_APP_URL || `http://localhost:${process.env.PORT || 3000}` })
+        .bookingDeclined({ to: party.email, tripTitle: trip.title, tripId: trip.id, itemKind: item.kind, reason: failureMessage(c) });
+      return res.status(c.kind === "definitive" ? 409 : 502).json({ code: c.kind === "definitive" ? "BOOKING_FAILED" : "BOOKING_UNCONFIRMED", title: c.kind === "definitive" ? "Booking failed" : "Booking not confirmed", detail: failureMessage(c) });
+    }
+    if (!result.ok && result.reason === "APPROVAL_RETRY_WINDOW_EXPIRED") {
+      // The first attempt may have reached the supplier. Do NOT invite a fresh approval (new idempotency key = possible double booking).
+      await Trips.event(agencyId, trip.id, "booking_unconfirmed", { itemId: item.id, code: result.reason, by: req.principal.actor });
+      await Trips.setItemStatus(item.id, agencyId, "reconciliation_required");
+      await advanceTrip(trip, "booking");
+      await syncTripStatus(agencyId, trip.id);
+      return res.status(409).json({ code: "BOOKING_UNCONFIRMED", title: "Booking not confirmed", detail: "We could not confirm this booking and it is now with our team. Please do not approve it again." });
+    }
     if (!result.ok) {
       await Trips.event(agencyId, trip.id, "booking_blocked", { itemId: item.id, reason: result.reason, by: req.principal.actor });
       if (trip.status === "awaiting_approval") { await Trips.setStatus(trip.id, agencyId, "itinerary_ready"); trip.status = "itinerary_ready"; }
@@ -224,6 +252,34 @@ router.post("/:tripId/items/:itemId/book", requireIdempotencyKey, async (req, re
     await advanceTrip(trip, "booking");
     await Trips.event(agencyId, trip.id, "booking_started", { itemId: item.id, bookingId, status: result.booking.status, by: req.principal.actor });
     res.status(202).json({ bookingId, status: result.booking.status });
+  } catch (err) { next(err); }
+});
+
+// Staff close an item that is "under review" after checking with the supplier. This is the only way out of
+// reconciliation_required once the safe retry window has passed, and it never creates a booking by itself.
+router.post("/:tripId/items/:itemId/resolve", requireRole("admin", "agent"), async (req, res, next) => {
+  try {
+    const agencyId = req.tenant.agencyId;
+    const { outcome, reference, note } = req.body || {};
+    if (!["confirmed", "not_booked"].includes(outcome)) throw bad("outcome must be confirmed or not_booked");
+    const ref = typeof reference === "string" ? reference.trim() : "";
+    if (outcome === "confirmed" && (!ref || ref.length > 80 || /[\r\n]/.test(ref))) throw bad("A supplier confirmation reference is required to mark this as booked (max 80 characters).");
+    const why = typeof note === "string" ? note.trim() : "";
+    if (why.length > 500) throw bad("note is too long (max 500 characters)");
+    const trip = await loadTrip(req);
+    const item = await Trips.getItem(req.params.itemId, trip.id, agencyId);
+    if (!item) throw Errors.NotFound("Trip item");
+    if (!(await Trips.resolveItem(item.id, agencyId, { outcome, reference: ref }))) throw new ApiError("NOT_UNDER_REVIEW", 409, "Not under review", "Only an item that is under review can be resolved.");
+    await Trips.event(agencyId, trip.id, "booking_resolved", { itemId: item.id, outcome, by: req.principal.actor, note: why || undefined });
+    await syncTripStatus(agencyId, trip.id);
+    const party = await Trips.bookingParties(trip);
+    if (party && party.email) {
+      const n = createNotifier({ getMailer: () => getMailer(), baseUrl: process.env.PUBLIC_APP_URL || `http://localhost:${process.env.PORT || 3000}` });
+      const base = { to: party.email, tripTitle: trip.title, tripId: trip.id, itemKind: item.kind };
+      if (outcome === "confirmed") n.bookingConfirmed({ ...base, ref, finalPrice: item.quoted_price, currency: item.currency });
+      else n.bookingDeclined({ ...base, reason: why || "The supplier had no record of this booking." });
+    }
+    res.json({ itemId: item.id, status: outcome === "confirmed" ? "confirmed" : "selected" });
   } catch (err) { next(err); }
 });
 
@@ -275,7 +331,7 @@ router.post("/:tripId/messages", async (req, res, next) => {
     const trip = await loadTrip(req);
     const model = getModel();
     if (!model) throw new ApiError("AGENT_MODEL_NOT_CONFIGURED", 503, "Assistant unavailable", "No AI model is configured for this deployment. You can still search and add offers manually.");
-    const party = await Trips.bookingParties(trip);
+    const party = await Trips.bookingParties(trip, { withPassport: false });
     const traveller = party ? { id: trip.traveler_id, firstName: party.first_name, nationality: party.nationality, preferences: (trip.brief || {}).preferences } : {};
     const handlers = createToolHandlers({ agencyId, tripId: trip.id, traveller }, { tapi: internalTapi(req), trips: Trips });
     const past = (await Trips.messages(trip.id, agencyId)).filter((m) => m.role !== "tool").slice(-20).map((m) => ({ role: m.role, content: m.content }));

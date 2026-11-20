@@ -14,7 +14,7 @@ export function startMock({ port = 0, dist, agentAvailable = false } = {}) {
   const send = (res, status, body) => { res.writeHead(status, { "Content-Type": "application/json" }); res.end(JSON.stringify(body)); };
   const problem = (res, status, code, title, detail, extra = {}) => send(res, status, { code, title, detail, ...extra });
   const ev = (tripId, type, payload = {}) => db.events.unshift({ id: randomUUID(), trip_id: tripId, type, payload, created_at: new Date().toISOString() });
-  const itemView = (i) => { const a = db.approvals.find((x) => x.item_id === i.id && x.status === "active" && new Date(x.expires_at) > new Date()); const fr = db.requests.filter((x) => x.item_id === i.id).at(-1); return { ...i, approval_id: a ? a.id : null, approval_expires_at: a ? a.expires_at : null, request_id: fr ? fr.id : null, request_status: fr ? fr.status : null, request_agent_name: fr ? fr.claimedByName || null : null, request_agent_note: fr ? fr.agentNote || null : null, request_decline_reason: fr ? fr.declineReason || null : null }; };
+  const itemView = (i) => { const a = db.approvals.find((x) => x.item_id === i.id && x.status === "active" && new Date(x.expires_at) > new Date()); const fr = db.requests.filter((x) => x.item_id === i.id).at(-1); return { ...i, approval_id: a ? a.id : null, approval_expires_at: a ? a.expires_at : null, retry_approval_id: (db.approvals.find((x) => x.item_id === i.id && x.status === "consumed" && !x.bookingId && x.retryUntil && new Date(x.retryUntil) > new Date()) || {}).id || null, request_id: fr ? fr.id : null, request_status: fr ? fr.status : null, request_agent_name: fr ? fr.claimedByName || null : null, request_agent_note: fr ? fr.agentNote || null : null, request_decline_reason: fr ? fr.declineReason || null : null }; };
   const mime = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
   const mail = (to, subject, token, purpose) => db.mail.push({ to, subject, token, purpose, text: `link #/${purpose === "verify" ? "verify" : "reset"}?token=${token}` });
   const missing = (t) => [!t.dateOfBirth && "dateOfBirth", !t.passport && "passportNumber", !t.nationality && "nationality"].filter(Boolean);
@@ -158,6 +158,16 @@ export function startMock({ port = 0, dist, agentAvailable = false } = {}) {
       } else { it.status = "approved"; it.fulfilment_mode = "automated"; if (["draft", "researching", "itinerary_ready"].includes(t.status)) t.status = "awaiting_approval"; ev(r[1], "item_approved", { itemId: it.id, role: P.role }); }
       return send(res, 201, { approvalId: a.id, expiresAt: a.expires_at, fulfilment: mode, requestId });
     }
+    if ((r = m(/^\/v1\/trips\/([^/]+)\/items\/([^/]+)\/resolve$/)) && req.method === "POST") {
+      if (!staff) return problem(res, 403, "FORBIDDEN", "Forbidden", "Your role cannot do this.");
+      const t = tripFor(r[1]); const it = db.items.find((i) => i.id === r[2] && i.trip_id === r[1]); if (!t || !it) return problem(res, 404, "NOT_FOUND", "Not found", "Trip item not found");
+      if (!["confirmed", "not_booked"].includes(body.outcome)) return problem(res, 400, "VALIDATION_ERROR", "Invalid request", "outcome must be confirmed or not_booked");
+      if (body.outcome === "confirmed" && !String(body.reference || "").trim()) return problem(res, 400, "VALIDATION_ERROR", "Invalid request", "A supplier confirmation reference is required to mark this as booked (max 80 characters).");
+      if (it.status !== "reconciliation_required") return problem(res, 409, "NOT_UNDER_REVIEW", "Not under review", "Only an item that is under review can be resolved.");
+      it.status = body.outcome === "confirmed" ? "confirmed" : "selected"; if (body.outcome === "confirmed") { it.confirmation_ref = body.reference; it.price_label = "confirmed"; }
+      const live = db.items.filter((i) => i.trip_id === t.id); t.status = live.every((i) => i.status === "confirmed") ? "booked" : live.some((i) => i.status === "confirmed") ? "partially_booked" : "itinerary_ready"; ev(t.id, "booking_resolved", { itemId: it.id, outcome: body.outcome });
+      return send(res, 200, { itemId: it.id, status: it.status });
+    }
     if ((r = m(/^\/v1\/trips\/([^/]+)\/items\/([^/]+)\/cancel-request$/)) && req.method === "POST") {
       const t = tripFor(r[1]); const it = db.items.find((i) => i.id === r[2] && i.trip_id === r[1]); if (!t || !it) return problem(res, 404, "NOT_FOUND", "Not found", "Trip item not found");
       const fr = db.requests.find((x) => x.item_id === it.id && x.status === "open");
@@ -172,6 +182,12 @@ export function startMock({ port = 0, dist, agentAvailable = false } = {}) {
       if (it.fulfilment_mode === "agent_assisted" && ["agent_requested", "agent_working"].includes(it.status)) return problem(res, 409, "HANDLED_BY_AGENT", "An agent is handling this", "This booking was sent to an agent.");
       const a = db.approvals.find((x) => x.id === body.approvalId && x.item_id === it.id); if (!a) return problem(res, 404, "NOT_FOUND", "Not found", "Approval not found");
       if (P.type === "session" && !P.emailVerified) return problem(res, 403, "EMAIL_NOT_VERIFIED", "Verify your email", "Confirm your email address before approving or booking.");
+      // A spent approval with no booking id: same-key retry inside the window only; later it stays under review (never re-approvable).
+      if (a.status === "consumed" && !a.bookingId) {
+        if (!(a.retryUntil && new Date(a.retryUntil) > new Date())) return problem(res, 409, "BOOKING_UNCONFIRMED", "Booking not confirmed", "We could not confirm this booking and it is now with our team. Please do not approve it again.");
+        db.bookingsMade = (db.bookingsMade || 0) + 1; it.status = "booking"; it.booking_id = `bk_${it.id.slice(0, 6)}`; a.bookingId = it.booking_id; t.status = "booking"; ev(t.id, "booking_started", { itemId: it.id });
+        return send(res, 202, { bookingId: it.booking_id, status: "pending" });
+      }
       if (!t.traveler_id) return problem(res, 400, "VALIDATION_ERROR", "Invalid request", "Choose a traveller for this trip before booking.");
       const tr = db.travelers.find((x) => x.id === t.traveler_id);
       if (it.kind === "flight" && missing(tr).length) return problem(res, 400, "PROFILE_INCOMPLETE", "Traveller details needed", `Add ${missing(tr).map((k) => ({ dateOfBirth: "date of birth", passportNumber: "passport number", nationality: "nationality" }[k])).join(", ")} to the traveller's profile before booking.`, { missing: missing(tr) });
@@ -180,7 +196,12 @@ export function startMock({ port = 0, dist, agentAvailable = false } = {}) {
         ev(t.id, "booking_blocked", { itemId: it.id, reason: "PRICE_INCREASED" });
         return send(res, 409, { code: "PRICE_INCREASED", title: "Booking not started", detail: "No booking was made.", livePrice: it.quoted_price, approvedPrice: Math.round(it.quoted_price / 1.12) });
       }
-      a.status = "consumed"; it.status = "booking"; it.price_label = "confirmed"; t.status = "booking"; it.booking_id = `bk_${it.id.slice(0, 6)}`; ev(t.id, "booking_started", { itemId: it.id });
+      if (it.details.simulate === "unconfirmed_once") {
+        a.status = "consumed"; a.retryUntil = new Date(Date.now() + 15 * 60000).toISOString(); it.details.simulate = null; it.status = "reconciliation_required"; t.status = "needs_attention"; ev(t.id, "booking_unconfirmed", { itemId: it.id });
+        return send(res, 502, { code: "BOOKING_UNCONFIRMED", title: "Booking not confirmed", detail: "We could not confirm this booking yet. Please do not approve it again: we are checking with the supplier so you are not booked twice." });
+      }
+      if (it.details.simulate === "rejected") { a.status = "consumed"; it.details.simulate = null; it.status = "selected"; it.price_label = "unverified"; t.status = "itinerary_ready"; ev(t.id, "booking_failed", { itemId: it.id }); return send(res, 409, { code: "BOOKING_FAILED", title: "Booking failed", detail: "The supplier did not accept this booking. Nothing was booked. Check the traveller's details and approve again." }); }
+      db.bookingsMade = (db.bookingsMade || 0) + 1; a.status = "consumed"; a.bookingId = `bk_${it.id.slice(0, 6)}`; it.status = "booking"; it.price_label = "confirmed"; t.status = "booking"; it.booking_id = `bk_${it.id.slice(0, 6)}`; ev(t.id, "booking_started", { itemId: it.id });
       return send(res, 202, { bookingId: it.booking_id, status: "pending" });
     }
     if ((r = m(/^\/v1\/trips\/([^/]+)\/items\/([^/]+)\/refresh$/))) { const it = db.items.find((i) => i.id === r[2]); it.status = "confirmed"; const tr = db.trips.find((x) => x.id === r[1]); tr.status = db.items.filter((i) => i.trip_id === tr.id).every((i) => i.status === "confirmed") ? "booked" : "partially_booked"; return send(res, 200, { itemId: it.id, bookingStatus: "confirmed", itemStatus: "confirmed" }); }

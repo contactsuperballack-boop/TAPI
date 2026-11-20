@@ -35,6 +35,9 @@ const { Errors } = require("../../domain/errors");
 class LetsFGHotelAdapter extends HotelSupplier {
   constructor(config) {
     super();
+    if (config.environment === "sandbox") {
+      throw new Error("LetsFG does not currently document a hotel sandbox. Hotel requests are blocked while LETSFG_ENVIRONMENT=sandbox to prevent accidental live calls.");
+    }
     if (config.authMode !== "developer") {
       // See module header: hotels appear to be Developer-API-only. Fail
       // loudly rather than silently trying a PFS-style call that doesn't exist.

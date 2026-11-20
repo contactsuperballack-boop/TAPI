@@ -2,6 +2,8 @@ const crypto = require("crypto");
 const db = require("../db");
 const { redactBookingAuditPayload, redactSupplierResponsePayload } = require("../domain/piiRedaction");
 const { assertValidTransition, requiresSupplierReference, INTERMEDIATE_STATES } = require("../domain/bookingStateMachine");
+const { outboxEventFor, LEASE_MS } = require("../domain/outbox");
+const { toMinor } = require("../domain/money");
 
 /** Deterministic hash of a booking request body, used to detect the same
  * idempotency key being reused with a materially different body. Deep-sorts
@@ -19,12 +21,23 @@ function hashRequestBody(body) {
   return crypto.createHash("sha256").update(stableStringify(body)).digest("hex");
 }
 
+/** Same-transaction outbox insert: the event exists if and only if the state change committed. */
+async function enqueueOutbox(tx, booking, fromStatus, toStatus, reason) {
+  const ev = outboxEventFor(booking.id, fromStatus, toStatus);
+  if (!ev) return;
+  await tx.query(
+    `INSERT INTO booking_outbox (booking_id, agency_id, event_type, payload, dedupe_key)
+     VALUES ($1,$2,$3,$4,$5) ON CONFLICT (dedupe_key) DO NOTHING`,
+    [booking.id, booking.agency_id, ev.eventType, { from: fromStatus, to: toStatus, reason: reason || null, type: booking.type, supplier: booking.supplier_code }, ev.dedupeKey]
+  );
+}
+
 const Searches = {
-  async create({ agencyId, type, criteria, supplierSearchRef }) {
+  async create({ agencyId, type, criteria, supplierSearchRef, supplierCode = "letsfg" }) {
     const { rows } = await db.query(
-      `INSERT INTO searches (agency_id, type, criteria, supplier_search_ref, status)
-       VALUES ($1,$2,$3,$4,'processing') RETURNING *`,
-      [agencyId, type, criteria, supplierSearchRef]
+      `INSERT INTO searches (agency_id, type, criteria, supplier_search_ref, supplier_code, status)
+       VALUES ($1,$2,$3,$4,$5,'processing') RETURNING *`,
+      [agencyId, type, criteria, supplierSearchRef, supplierCode]
     );
     return rows[0];
   },
@@ -158,6 +171,7 @@ const Bookings = {
          VALUES ($1,$2,$3,$4,$5,$6)`,
         [id, current.status, toStatus, actor, reason || null, metadata || null]
       );
+      await enqueueOutbox(tx, rows[0], current.status, toStatus, reason);
 
       return rows[0];
     });
@@ -166,7 +180,7 @@ const Bookings = {
   /** Updates supplier_reference without a status transition — e.g. attaching a hotel async job ref while the booking stays 'pending'. Not a state-machine event, just a field update. */
   async attachSupplierReference(id, supplierReference) {
     const { rows } = await db.query(
-      `UPDATE bookings SET supplier_reference=$2, updated_at=now() WHERE id=$1 RETURNING *`,
+      `UPDATE bookings SET supplier_booking_id=$2, supplier_reference=COALESCE(supplier_reference, $2), updated_at=now() WHERE id=$1 RETURNING *`,
       [id, supplierReference]
     );
     return rows[0];
@@ -197,6 +211,95 @@ const Bookings = {
   async get(id, agencyId) {
     const { rows } = await db.query(`SELECT * FROM bookings WHERE id=$1 AND agency_id=$2`, [id, agencyId]);
     return rows[0] || null;
+  },
+
+
+  // A booking for this offer that may correspond to a real supplier booking (see migration 021).
+  async findLiveForOffer(offerId) {
+    const { rows } = await db.query(
+      `SELECT * FROM bookings WHERE offer_id=$1
+         AND status IN ('created','pending','processing','ticketing_pending','reconciliation_required','confirmed') LIMIT 1`, [offerId]);
+    return rows[0] || null;
+  },
+
+  // created -> pending AND the submission intent, atomically, BEFORE any supplier call.
+  // If the process dies after this commits, recovery knows a submission may have happened.
+  async beginSubmission(id, submissionKey, { actor = "system", reason = "calling supplier" } = {}) {
+    return db.withTransaction(async (tx) => {
+      const { rows: cur } = await tx.query(`SELECT * FROM bookings WHERE id=$1 FOR UPDATE`, [id]);
+      if (!cur[0]) throw new Error(`Booking ${id} not found — cannot begin submission`);
+      assertValidTransition(cur[0].status, "pending");
+      const { rows } = await tx.query(
+        `UPDATE bookings SET status='pending', submission_key=$2, submission_started_at=now(), updated_at=now() WHERE id=$1 RETURNING *`,
+        [id, submissionKey]
+      );
+      await tx.query(
+        `INSERT INTO booking_state_transitions (booking_id, from_status, to_status, actor, reason) VALUES ($1,$2,'pending',$3,$4)`,
+        [id, cur[0].status, actor, reason]
+      );
+      return rows[0];
+    });
+  },
+
+  // Supplier accepted an asynchronous booking: store ITS id and move to processing in ONE transaction
+  // (previously two statements, with a crash window between them). supplier_reference is deliberately left NULL:
+  // it means EVIDENCE (PNR/ticket) and the 'confirmed needs a reference' guard must not be satisfiable by a booking id.
+  async recordSupplierAcceptance(id, supplierBookingId, { actor = "system", reason = "supplier accepted asynchronous booking" } = {}) {
+    return db.withTransaction(async (tx) => {
+      const { rows: cur } = await tx.query(`SELECT * FROM bookings WHERE id=$1 FOR UPDATE`, [id]);
+      if (!cur[0]) throw new Error(`Booking ${id} not found`);
+      assertValidTransition(cur[0].status, "processing");
+      const { rows } = await tx.query(
+        `UPDATE bookings SET status='processing', supplier_booking_id=$2, updated_at=now() WHERE id=$1 RETURNING *`,
+        [id, supplierBookingId]
+      );
+      await tx.query(
+        `INSERT INTO booking_state_transitions (booking_id, from_status, to_status, actor, reason) VALUES ($1,$2,'processing',$3,$4)`,
+        [id, cur[0].status, actor, reason]
+      );
+      return rows[0];
+    });
+  },
+
+  // 'pending', no supplier id, submission started longer ago than the in-flight window.
+  async findSubmissionOrphans(olderThanMinutes = 3, limit = 25) {
+    const { rows } = await db.query(
+      `SELECT * FROM bookings
+       WHERE status='pending' AND supplier_booking_id IS NULL AND type='flight'
+         AND COALESCE(submission_started_at, updated_at) < now() - ($1 || ' minutes')::interval
+         AND recovery_attempts < 5
+       ORDER BY COALESCE(submission_started_at, updated_at) ASC LIMIT $2`,
+      [olderThanMinutes, limit]
+    );
+    return rows;
+  },
+  async bumpRecoveryAttempts(id) {
+    await db.query(`UPDATE bookings SET recovery_attempts = recovery_attempts + 1 WHERE id=$1`, [id]);
+  },
+
+  // Polling bookkeeping (migration 018). Deliberately does NOT touch updated_at:
+  // a poll is not a state change, and stuck-booking detection keys off updated_at.
+  async markPolled(id, { attempts, nextPollAt }) {
+    await db.query(
+      `UPDATE bookings SET poll_attempts=$2, last_polled_at=now(), next_poll_at=$3 WHERE id=$1`,
+      [id, attempts, nextPollAt || null]
+    );
+  },
+
+  // Asynchronous bookings that have a supplier reference and are due for a poll.
+  // New async bookings have next_poll_at NULL, which counts as due immediately.
+  async findDueForPolling(limit = 50) {
+    const { rows } = await db.query(
+      `SELECT * FROM bookings
+       WHERE supplier_booking_id IS NOT NULL
+         AND type = 'flight'
+         AND status IN ('pending','processing','ticketing_pending','reconciliation_required')
+         AND (next_poll_at IS NULL OR next_poll_at <= now())
+       ORDER BY COALESCE(next_poll_at, created_at) ASC
+       LIMIT $1`,
+      [limit]
+    );
+    return rows;
   },
   // Fix for a confirmed gap: raw_request previously stored traveler/guest
   // PII (names, DOB, passport numbers, contact details) in plaintext with
@@ -415,9 +518,16 @@ const Payments = {
         throw err;
       }
 
+      const capturedMinor = toMinor(payment.amount, payment.currency);
       const { rows: updatedPaymentRows } = await tx.query(
-        `UPDATE payments SET status='captured', webhook_verified_at=now(), provider_event_id=COALESCE($2, provider_event_id) WHERE id=$1 RETURNING *`,
-        [paymentId, eventId || null]
+        `UPDATE payments SET status='captured', captured_minor=$3, webhook_verified_at=now(), provider_event_id=COALESCE($2, provider_event_id) WHERE id=$1 RETURNING *`,
+        [paymentId, eventId || null, capturedMinor]
+      );
+      // The provider captured at checkout (automatic mode): record it in the ledger in the SAME transaction.
+      await tx.query(
+        `INSERT INTO ledger_entries (agency_id, order_id, payment_id, kind, amount_minor, currency, idempotency_key, provider_ref)
+         VALUES ($1,$2,$3,'capture',$4,$5,$6,$7) ON CONFLICT (idempotency_key) DO NOTHING`,
+        [payment.agency_id, payment.order_id, payment.id, capturedMinor, payment.currency, `webhook-capture:${payment.id}`, payment.provider_ref]
       );
       const { rows: orderRows } = await tx.query(`UPDATE orders SET status='paid' WHERE id=$1 RETURNING *`, [orderId]);
       return { payment: updatedPaymentRows[0], order: orderRows[0], alreadyProcessed: false };
@@ -429,6 +539,59 @@ const Payments = {
       [id]
     );
     return rows[0];
+  },
+  // Manual-capture providers: the customer's card was AUTHORISED (funds held), not charged. Does not mark the order
+  // paid: whether "authorised" counts as secured for fulfilment is a product decision (see SPRINT10 doc).
+  async markAuthorizedFromWebhook(id, { amountMinor, expiresAt, eventId }) {
+    return db.withTransaction(async (tx) => {
+      const { rows: cur } = await tx.query(`SELECT * FROM payments WHERE id=$1 FOR UPDATE`, [id]);
+      const p = cur[0];
+      if (!p) throw new Error(`Payment ${id} not found`);
+      if (p.status !== "pending") return { payment: p, alreadyProcessed: true };
+      const { rows } = await tx.query(
+        `UPDATE payments SET status='authorized', capture_mode='manual', authorized_minor=$2, authorization_expires_at=$3,
+           webhook_verified_at=now(), provider_event_id=COALESCE($4, provider_event_id) WHERE id=$1 RETURNING *`,
+        [id, amountMinor, expiresAt || null, eventId || null]
+      );
+      await tx.query(
+        `INSERT INTO ledger_entries (agency_id, order_id, payment_id, kind, amount_minor, currency, idempotency_key, provider_ref)
+         VALUES ($1,$2,$3,'authorization',$4,$5,$6,$7) ON CONFLICT (idempotency_key) DO NOTHING`,
+        [p.agency_id, p.order_id, p.id, amountMinor, p.currency, `authorization:${p.id}`, p.provider_ref]
+      );
+      return { payment: rows[0], alreadyProcessed: false };
+    });
+  },
+  async markCaptureFailed(id) {
+    await db.query(`UPDATE payments SET status='capture_failed' WHERE id=$1 AND status IN ('authorized','capture_failed')`, [id]);
+  },
+  // Completion entry + payment counters in ONE transaction. The ledger insert is the guard: if the entry already
+  // exists (a retry after a crash) nothing is counted twice.
+  async applySettlementCompletion(id, { kind, entry }) {
+    return db.withTransaction(async (tx) => {
+      const { rows: ins } = await tx.query(
+        `INSERT INTO ledger_entries (agency_id, order_id, payment_id, booking_id, kind, amount_minor, currency, idempotency_key, provider_ref, detail)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`,
+        [entry.agencyId, entry.orderId, entry.paymentId, entry.bookingId || null, kind, entry.amountMinor, entry.currency, entry.idempotencyKey, entry.providerRef || null, entry.detail || null]
+      );
+      if (!ins[0]) return { duplicate: true };
+      const col = { capture: "captured_minor", void: "voided_minor", refund: "refunded_minor" }[kind];
+      if (!col) throw new Error(`applySettlementCompletion: unsupported kind ${kind}`);
+      const status = kind === "capture" ? "'captured'" : kind === "void" ? "'voided'"
+        : "CASE WHEN refunded_minor + $2 >= captured_minor THEN 'refunded' ELSE status END";
+      const { rows } = await tx.query(`UPDATE payments SET ${col} = ${col} + $2, status = ${status} WHERE id=$1 RETURNING *`, [id, entry.amountMinor]);
+      return { duplicate: false, payment: rows[0] };
+    });
+  },
+  // Payments that may need a settlement decision: every authorised one (capture/void/expiry watch), and captured ones
+  // with a failed/cancelled booking still owed a refund.
+  async findSettlementCandidates(limit = 50) {
+    const { rows } = await db.query(
+      `SELECT p.* FROM payments p
+       WHERE p.status = 'authorized'
+          OR (p.status = 'captured' AND p.refunded_minor < p.captured_minor
+              AND EXISTS (SELECT 1 FROM bookings b WHERE b.order_id = p.order_id AND b.status IN ('failed','cancelled')))
+       ORDER BY p.created_at ASC LIMIT $1`, [limit]);
+    return rows;
   },
   async markRefunded(id) {
     const { rows } = await db.query(`UPDATE payments SET status='refunded' WHERE id=$1 RETURNING *`, [id]);
@@ -444,4 +607,78 @@ const Payments = {
   },
 };
 
-module.exports = { Searches, Offers, Bookings, HotelBookingDetails, BusBookingDetails, Orders, Payments, hashRequestBody };
+
+const Outbox = {
+  // Claim due events with a lease (available_at pushed forward) so concurrent dispatchers never share a row
+  // and a crashed dispatcher's rows become claimable again when the lease lapses.
+  async claimBatch(limit = 25) {
+    const { rows } = await db.query(
+      `UPDATE booking_outbox SET attempts = attempts + 1, available_at = now() + ($2 || ' milliseconds')::interval
+       WHERE id IN (
+         SELECT id FROM booking_outbox
+         WHERE delivered_at IS NULL AND dead_at IS NULL AND available_at <= now()
+         ORDER BY created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED)
+       RETURNING *`,
+      [limit, LEASE_MS]
+    );
+    return rows;
+  },
+  async markDelivered(id) { await db.query(`UPDATE booking_outbox SET delivered_at=now(), last_error=NULL WHERE id=$1`, [id]); },
+  async scheduleRetry(id, delayMs, error) {
+    await db.query(`UPDATE booking_outbox SET available_at = now() + ($2 || ' milliseconds')::interval, last_error=$3 WHERE id=$1`, [id, delayMs, String(error).slice(0, 500)]);
+  },
+  async markDead(id, error) { await db.query(`UPDATE booking_outbox SET dead_at=now(), last_error=$2 WHERE id=$1`, [id, String(error).slice(0, 500)]); },
+};
+
+
+const Ledger = {
+  async append(e) {
+    const { rows } = await db.query(
+      `INSERT INTO ledger_entries (agency_id, order_id, payment_id, booking_id, kind, amount_minor, currency, idempotency_key, provider_ref, detail)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (idempotency_key) DO NOTHING RETURNING *`,
+      [e.agencyId || null, e.orderId || null, e.paymentId, e.bookingId || null, e.kind, e.amountMinor, e.currency, e.idempotencyKey, e.providerRef || null, e.detail || null]
+    );
+    return rows[0] || null; // null = an entry with this key already exists
+  },
+  async findByKey(key) {
+    const { rows } = await db.query(`SELECT * FROM ledger_entries WHERE idempotency_key=$1`, [key]);
+    return rows[0] || null;
+  },
+  // Balances derived from COMPLETED entries only (requests and failures never move money).
+  async balances(paymentId) {
+    const { rows } = await db.query(
+      `SELECT kind, COALESCE(SUM(amount_minor),0) AS total FROM ledger_entries
+       WHERE payment_id=$1 AND kind IN ('authorization','capture','void','refund') GROUP BY kind`, [paymentId]);
+    const by = Object.fromEntries(rows.map((r) => [r.kind, Number(r.total)]));
+    return { authorized: by.authorization || 0, captured: by.capture || 0, voided: by.void || 0, refunded: by.refund || 0 };
+  },
+  async forPayment(paymentId) {
+    const { rows } = await db.query(`SELECT * FROM ledger_entries WHERE payment_id=$1 ORDER BY created_at, id`, [paymentId]);
+    return rows;
+  },
+};
+
+const FxQuotes = {
+  async create(agencyId, q) {
+    const { rows } = await db.query(
+      `INSERT INTO fx_quotes (agency_id, base_currency, quote_currency, mid_rate, buffer_bps, source, as_of, created_at, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [agencyId, q.baseCurrency, q.quoteCurrency, q.midRate, q.bufferBps, q.source, q.asOf, q.createdAt, q.expiresAt]
+    );
+    return rows[0];
+  },
+  async get(id, agencyId) {
+    const { rows } = await db.query(`SELECT * FROM fx_quotes WHERE id=$1 AND agency_id=$2`, [id, agencyId]);
+    return rows[0] || null;
+  },
+  // The conditional UPDATE is the single arbiter of "used exactly once, and not expired".
+  async consume(id, agencyId, consumedBy) {
+    const { rows } = await db.query(
+      `UPDATE fx_quotes SET consumed_at=now(), consumed_by=$3 WHERE id=$1 AND agency_id=$2 AND consumed_at IS NULL AND expires_at > now() RETURNING *`,
+      [id, agencyId, consumedBy]
+    );
+    return rows[0] || null;
+  },
+};
+
+module.exports = { Searches, Offers, Bookings, Outbox, Ledger, FxQuotes, HotelBookingDetails, BusBookingDetails, Orders, Payments, hashRequestBody };

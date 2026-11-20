@@ -13,7 +13,14 @@
     "mcp": "node src/mcp/server.js",
     "reconcile": "node src/scripts/reconcile.js",
     "test": "jest --runInBand",
-    "test:unit": "node --test \"tests/unit/**/*.test.js\""
+    "test:unit": "node --test \"tests/unit/**/*.test.js\"",
+    "passports:encrypt": "node scripts/encrypt-passports.js",
+    "letsfg:sandbox-smoke": "node scripts/letsfg-sandbox-smoke.js",
+    "poll:bookings": "node src/scripts/pollBookings.js",
+    "outbox:dispatch": "node src/scripts/dispatchOutbox.js",
+    "check:syntax": "node scripts/check-syntax.js",
+    "ci": "npm run check:syntax && npm run test:unit",
+    "settle:sweep": "node src/scripts/settleSweep.js"
   },
   "devDependencies": {
     "jest": "^29.7.0",

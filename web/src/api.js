@@ -71,6 +71,7 @@ export function createApi({ baseUrl = "", apiKey, fetchImpl = (...a) => globalTh
     addItem: (id, kind, offerId) => request("POST", `/v1/trips/${id}/items`, { body: { kind, offerId } }),
     // Approve exactly the price the user saw. The server rejects any mismatch.
     approve: (tripId, item, { clientConsent, fulfilment, travellerNote } = {}) => request("POST", `/v1/trips/${tripId}/items/${item.id}/approve`, { body: { confirm: true, acknowledgedPrice: Number(item.quoted_price), currency: item.currency, ...(clientConsent ? { clientConsent: true } : {}), ...(fulfilment ? { fulfilment } : {}), ...(travellerNote ? { travellerNote } : {}) } }),
+    resolveItem: (tripId, itemId, b) => request("POST", `/v1/trips/${tripId}/items/${itemId}/resolve`, { body: b }),
     cancelRequest: (tripId, itemId) => request("POST", `/v1/trips/${tripId}/items/${itemId}/cancel-request`),
     listRequests: (scope) => request("GET", `/v1/fulfilment?scope=${scope}`).then((r) => r.requests),
     claimRequest: (id) => request("POST", `/v1/fulfilment/${id}/claim`),

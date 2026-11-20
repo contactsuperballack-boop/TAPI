@@ -5,15 +5,25 @@
 // serve more than one agency.
 const { randomUUID } = require("crypto");
 
-function createTapiClient({ baseUrl, apiKey, headers: extraHeaders = {}, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), pollIntervalMs = 3000, maxPolls = 20 }) {
+function createTapiClient({ baseUrl, apiKey, headers: extraHeaders = {}, timeoutMs = 15_000, bookingTimeoutMs = 45_000, fetchImpl = globalThis.fetch, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), pollIntervalMs = 3000, maxPolls = 20 }) {
   if (!apiKey) throw new Error("apiKey is required");
   if (!baseUrl) throw new Error("baseUrl is required");
 
-  async function request(method, path, { body, idempotencyKey } = {}) {
+  // Every call has a hard deadline (an aborted fetch frees us; it cannot cancel work already started on the server,
+  // so a timeout on a booking is an AMBIGUOUS outcome, which domain/bookingFailure.js treats as such).
+  async function request(method, path, { body, idempotencyKey, timeout = timeoutMs } = {}) {
     const headers = { ...extraHeaders, Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" };
     if (idempotencyKey) headers["Idempotency-Key"] = idempotencyKey;
-    const res = await fetchImpl(`${baseUrl}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined });
-    const data = await res.json().catch(() => ({}));
+    // Explicit controller + timer (cleared when the call ends) rather than AbortSignal.timeout: nothing lingers after the call.
+    const ctrl = new AbortController(); const timer = setTimeout(() => ctrl.abort(), timeout);
+    let res; let data;
+    try {
+      res = await fetchImpl(`${baseUrl}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: ctrl.signal });
+      data = await res.json().catch(() => ({}));
+    } catch (e) {
+      const timedOut = ctrl.signal.aborted || (e && (e.name === "TimeoutError" || e.name === "AbortError"));
+      throw Object.assign(new Error(timedOut ? "TAPI request timed out" : "TAPI request could not be sent"), { code: timedOut ? "TIMEOUT" : "NETWORK" });
+    } finally { clearTimeout(timer); }
     if (!res.ok) {
       const err = new Error(data.detail || data.title || `TAPI request failed: ${res.status}`);
       err.status = res.status;
@@ -54,10 +64,10 @@ function createTapiClient({ baseUrl, apiKey, headers: extraHeaders = {}, fetchIm
       return request("POST", `/v1/hotels/offers/${offerId}/validate`);
     },
     async bookFlight(body, idempotencyKey) {
-      return request("POST", "/v1/flights/bookings", { body, idempotencyKey });
+      return request("POST", "/v1/flights/bookings", { body, idempotencyKey, timeout: bookingTimeoutMs });
     },
     async bookHotel(body, idempotencyKey) {
-      return request("POST", "/v1/hotels/bookings", { body, idempotencyKey });
+      return request("POST", "/v1/hotels/bookings", { body, idempotencyKey, timeout: bookingTimeoutMs });
     },
     async getBooking(kind, id) {
       return request("GET", `/v1/${kind === "flight" ? "flights" : "hotels"}/bookings/${id}`);

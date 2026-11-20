@@ -8,7 +8,7 @@ function Shell({ children }) {
   return (
     <main className="main authwrap">
       <div className="stack" style={{ gap: 18 }}>
-        <div className="brand" style={{ padding: 0 }}><span className="dot"><Icon name="plane" size={16} /></span>TAPI Travel Agent</div>
+        <div className="brand auth-brand" style={{ padding: 0 }}><img className="brand-mark" src="/tapi-logo.jpeg" alt="TAPI" /><span>TAPI Travel Agent</span></div>
         {children}
       </div>
     </main>

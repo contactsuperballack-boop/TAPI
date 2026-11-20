@@ -32,6 +32,8 @@ const Errors = {
   SupplierTimeout: (detail) => new ApiError("SUPPLIER_TIMEOUT", 504, "Supplier timeout", detail),
   PriceChanged: (detail) => new ApiError("PRICE_CHANGED", 409, "Supplier price changed", detail),
   SoldOut: () => new ApiError("SOLD_OUT", 409, "Offer sold out", "This offer is no longer available."),
+  BookingInProgressForOffer: (detail) => new ApiError("BOOKING_IN_PROGRESS_FOR_OFFER", 409, "A booking for this offer already exists", detail),
+  NotSupported: (detail) => new ApiError("NOT_SUPPORTED", 501, "Not supported by this supplier", detail),
   Internal: (detail) => new ApiError("INTERNAL_ERROR", 500, "Internal error", detail),
 };
 

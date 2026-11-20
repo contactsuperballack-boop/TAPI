@@ -17,7 +17,7 @@ async function session(viewport, tag) {
   const ctx = await browser.newContext({ viewport, deviceScaleFactor: 2 });
   const page = await ctx.newPage(); current = page; page.setDefaultTimeout(8000); const errors = [];
   page.on("pageerror", (e) => errors.push(e.message)); // the browser logs every non-2xx response; 401 (bad key) and 409 (blocked booking) are triggered on purpose
-  page.on("console", (m) => m.type() === "error" && !/status of (401|409)/.test(m.text()) && errors.push(m.text()));
+  page.on("console", (m) => m.type() === "error" && !/status of (401|409|502)/.test(m.text()) && errors.push(m.text()));
   await page.goto(base);
 
   await step(`${tag}: rejects a bad key, accepts a good one`, async () => {
@@ -108,6 +108,33 @@ async function session(viewport, tag) {
     await card.getByRole("button", { name: "Review and approve" }).click();
     await page.getByRole("dialog").getByText("$605").first().waitFor();
     await page.getByRole("button", { name: "Close" }).click();
+  });
+  await step(`${tag}: a booking we cannot confirm is held for review (never re-approvable) and can be retried safely without double booking`, async () => {
+    const hotel = page.getByRole("article", { name: "Kensington Court Hotel" });
+    db.items.find((i) => i.kind === "hotel").details.simulate = "unconfirmed_once"; db.bookingsMade = 0;
+    await hotel.getByRole("button", { name: "Review and approve" }).click(); await page.getByRole("button", { name: "Approve $640" }).click(); await page.getByText(/Approved\. You can now book/).waitFor();
+    await hotel.getByRole("button", { name: "Book now" }).click();
+    await page.getByText(/We could not confirm this booking yet/).first().waitFor();
+    await hotel.getByText("Under review", { exact: true }).waitFor(); await page.getByText("Needs attention").first().waitFor();
+    assert.equal(await hotel.getByRole("button", { name: /approve/i }).count(), 0);                 // no way to approve again while the outcome is unknown
+    assert.equal(db.bookingsMade, 0);
+    await page.screenshot({ path: `${shots}/${tag}-9b-under-review.png`, fullPage: true });
+    await hotel.getByRole("button", { name: "Try confirming again" }).click(); await page.getByText(/Booking started/).waitFor();
+    assert.equal(db.bookingsMade, 1);                                                                // the retry produced exactly one booking
+  });
+  await step(`${tag}: after the retry window, only a person can close it out; saying it was booked needs the supplier reference`, async () => {
+    const lh = page.getByRole("article", { name: "Lufthansa flight" });
+    db.items.find((i) => i.details.airline === "Lufthansa").details.simulate = "unconfirmed_once";
+    await lh.getByRole("button", { name: "Review and approve" }).click(); await page.getByRole("button", { name: "Approve $605" }).click(); await page.getByText(/Approved\. You can now book/).waitFor();
+    await lh.getByRole("button", { name: "Book now" }).click(); await lh.getByText("Under review", { exact: true }).waitFor();
+    for (const a of db.approvals) if (a.retryUntil) a.retryUntil = new Date(Date.now() - 1000).toISOString();     // the window passes
+    await page.reload(); await lh.getByText("Under review", { exact: true }).waitFor();
+    assert.equal(await lh.getByRole("button", { name: "Try confirming again" }).count(), 0);
+    await lh.getByRole("button", { name: "Resolve this booking" }).click();
+    assert.equal(await page.getByRole("button", { name: "Save outcome" }).isDisabled(), true);       // reference required
+    await page.screenshot({ path: `${shots}/${tag}-9c-resolve.png` });
+    await page.getByLabel("Supplier confirmation reference").fill("SUP-9"); await page.getByRole("button", { name: "Save outcome" }).click();
+    await page.getByText(/Marked as booked/).waitFor(); await lh.getByText("Confirmed", { exact: true }).waitFor(); await lh.getByText("SUP-9").waitFor();
   });
   await step(`${tag}: assistant tab explains when no model is configured; activity lists events`, async () => {
     await page.getByRole("tab", { name: "Assistant" }).click();

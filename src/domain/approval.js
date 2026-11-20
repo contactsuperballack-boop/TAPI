@@ -4,6 +4,10 @@
 // concurrent bookings cannot both pass.
 
 const DEFAULT_TTL_MINUTES = 30;
+// A spent approval with no booking id may be re-sent (same idempotency key) only briefly: long enough to recover from a
+// crash or timeout, short enough that an unvalidated retry cannot book a stale price days later. Override: APPROVAL_RETRY_WINDOW_MINUTES.
+const RETRY_WINDOW_MINUTES = Number(process.env.APPROVAL_RETRY_WINDOW_MINUTES) > 0 ? Number(process.env.APPROVAL_RETRY_WINDOW_MINUTES) : 15;
+const RETRY_WINDOW_MS = RETRY_WINDOW_MINUTES * 60_000;
 
 function buildApproval({ agencyId, tripId, tripItemId, offerId, price, currency, toleranceBps = 0, ttlMinutes = DEFAULT_TTL_MINUTES, now = new Date() }) {
   if (!offerId) throw new Error("offerId is required");
@@ -50,7 +54,8 @@ function fromRow(r) {
     status: r.status,
     expiresAt: r.expires_at ?? r.expiresAt,
     consumedBookingId: r.consumed_booking_id ?? r.consumedBookingId ?? null,
+    consumedAt: r.consumed_at ?? r.consumedAt ?? null,
   };
 }
 
-module.exports = { DEFAULT_TTL_MINUTES, buildApproval, checkApproval, fromRow };
+module.exports = { RETRY_WINDOW_MINUTES, RETRY_WINDOW_MS, DEFAULT_TTL_MINUTES, buildApproval, checkApproval, fromRow };

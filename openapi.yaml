@@ -202,7 +202,12 @@ paths:
             schema: { $ref: '#/components/schemas/FlightBookingRequest' }
       responses:
         '201':
-          description: Booking created (status reflects what the supplier actually confirmed — see FlightBookingResponse.status)
+          description: Supplier answered synchronously (status reflects what the supplier actually confirmed — see FlightBookingResponse.status)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FlightBookingResponse' }
+        '202':
+          description: Supplier accepted an asynchronous booking. Status is `processing`; it is NOT ticketed. Poll GET /flights/bookings/{bookingId} (a background worker also polls). Only `confirmed` with a reference is a booking.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/FlightBookingResponse' }
@@ -599,6 +604,8 @@ components:
           type: string
           description: >
             Only 'confirmed' means the supplier actually returned a PNR.
+            'processing' = an asynchronous supplier accepted the booking; outcome pending.
+            'ticketing_pending' = reservation held, ticket NOT yet issued; not a booking.
             'action_required' means the supplier handed back a checkout URL
             instead (see bookingUrl) and no reservation exists yet.
             'reconciliation_required' means the supplier call timed out or

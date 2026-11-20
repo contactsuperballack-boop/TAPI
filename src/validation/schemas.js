@@ -27,7 +27,19 @@ const travelerSchema = z.object({
   lastName: z.string().min(1),
   dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   passportNumber: z.string().optional(),
-  nationality: z.string().optional(),
+  passportCountry: z.string().length(2).optional(),
+  passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  nationality: z.string().length(2).optional(),
+  gender: z.enum(["m", "f"]).optional(),
+  email: z.string().email().optional(),
+  phoneNumber: z.string().optional(),
+  phoneCountry: z.string().length(2).optional(),
+  passengerType: z.enum(["adult", "child", "infant"]).optional(),
+  addressLine1: z.string().optional(),
+  addressCity: z.string().optional(),
+  addressPostal: z.string().optional(),
+  addressCountry: z.string().length(2).optional(),
 });
 
 const flightBookingSchema = z.object({
@@ -38,6 +50,9 @@ const flightBookingSchema = z.object({
     phone: z.string().optional(),
   }),
   travelerIds: z.array(z.string().uuid()).optional(),
+  wantSeat: z.boolean().optional(),
+  sandboxScenario: z.enum(["success", "price_change", "extra", "seller_failed", "needs_attention", "payment_declined", "payment_method_required", "temporarily_unavailable"]).optional(),
+  sandboxSpeed: z.enum(["fast", "realistic"]).optional(),
 });
 
 /** Express middleware factory: validates req.body against a zod schema. */
@@ -98,9 +113,16 @@ const hotelBookingSchema = z.object({
   }),
 });
 
+const flightBookingAnswerSchema = z.object({
+  round: z.number().int().positive(),
+  confirm: z.literal(true).optional(),
+  skip: z.literal(true).optional(),
+  seats: z.array(z.object({ passenger: z.number().int().nonnegative(), designator: z.string().min(1) })).min(1).optional(),
+}).refine((v) => [v.confirm, v.skip, v.seats].filter((x) => x !== undefined).length === 1, { message: "Provide exactly one of confirm, skip, or seats" });
+
 const createOrderSchema = z.object({
   bookingIds: z.array(z.string().uuid()).min(1),
   customerId: z.string().uuid().optional(),
 });
 
-module.exports = { flightSearchSchema, flightBookingSchema, hotelSearchSchema, hotelBookingSchema, busSearchSchema, busBookingSchema, createOrderSchema, validateBody };
+module.exports = { flightSearchSchema, flightBookingSchema, flightBookingAnswerSchema, hotelSearchSchema, hotelBookingSchema, busSearchSchema, busBookingSchema, createOrderSchema, validateBody };

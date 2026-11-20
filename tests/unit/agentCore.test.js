@@ -139,7 +139,7 @@ test("executor: losing the consume race books nothing", async () => {
 });
 
 test("executor: consumed approval with no booking id retries with the SAME key and skips revalidation", async () => {
-  const { calls, deps } = fakeDeps({ approval: mkApproval({ status: "consumed" }), verdict: goodVerdict });
+  const { calls, deps } = fakeDeps({ approval: mkApproval({ status: "consumed", consumed_at: new Date(NOW.getTime() - 60_000) }), verdict: goodVerdict });
   const r = await run(deps);
   assert.equal(r.ok, true);
   assert.equal(calls.validate, 0); assert.equal(calls.consume, 0);
@@ -198,6 +198,6 @@ test("trip progression: forward-only through legal hops, never out of terminal o
 test("executor reports the revalidated live price on a fresh booking, and none on the retry path", async () => {
   let f = fakeDeps({ approval: mkApproval(), verdict: { offerId: "off1", valid: true, offer: { price: 480, currency: "USD" } } });
   assert.equal((await run(f.deps)).livePrice, 480);
-  f = fakeDeps({ approval: mkApproval({ status: "consumed" }), verdict: goodVerdict });
+  f = fakeDeps({ approval: mkApproval({ status: "consumed", consumed_at: new Date(NOW.getTime() - 60_000) }), verdict: goodVerdict });
   assert.equal((await run(f.deps)).livePrice, undefined);
 });

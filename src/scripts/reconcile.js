@@ -29,12 +29,32 @@ const db = require("../db");
 const { Bookings } = require("../repositories");
 const { getSupplier, getHotelSupplier } = require("../services/supplierRegistry");
 const { mapBookingState } = require("../domain/bookingState");
+const { syncBooking, supplierBookingId } = require("../services/bookingSync");
 const { writeAuditEvent } = require("../middleware/auditLog");
 
 const STUCK_THRESHOLD_MINUTES = Number(process.env.RECONCILE_STUCK_THRESHOLD_MINUTES) || 15;
 
 async function reconcileOne(booking) {
   const log = { bookingId: booking.id, type: booking.type, status: booking.status };
+
+  // Flights: use the shared, supplier-agnostic sync. Previously this script mapped the raw
+  // supplier status string, which never recognised LetsFG's "completed" and left async
+  // bookings stuck as ambiguous forever.
+  if (booking.type === "flight" && supplierBookingId(booking)) {
+    try {
+      const { booking: updated, live, changed } = await syncBooking(booking, { Bookings, getSupplier, actor: "reconcile-script" });
+      const action = changed ? `resolved_${updated.status}` : "still_ambiguous";
+      console.log(JSON.stringify({ ...log, action, supplierState: live.status }));
+      if (!changed) {
+        await writeAuditEvent({ agencyId: booking.agency_id, actor: "reconcile-script", action: "RECONCILIATION_STILL_AMBIGUOUS", resourceType: "booking", resourceId: booking.id, metadata: { supplierStatus: live.status } });
+      }
+      return { ...log, action };
+    } catch (err) {
+      console.error(JSON.stringify({ ...log, action: "reconciliation_attempt_failed", error: err.message }));
+      await writeAuditEvent({ agencyId: booking.agency_id, actor: "reconcile-script", action: "RECONCILIATION_ATTEMPT_FAILED", resourceType: "booking", resourceId: booking.id, metadata: { error: err.message } });
+      return { ...log, action: "attempt_failed", error: err.message };
+    }
+  }
 
   if (booking.status !== "reconciliation_required" || !booking.supplier_reference) {
     // Stuck in 'pending'/'processing'/'cancel_requested'/'refund_pending'
